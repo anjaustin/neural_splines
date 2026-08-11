@@ -200,7 +200,37 @@ is divided. A hand-tuned grid does slightly better still (95.76% for
 rather than an optimum — pass an explicit `(cp_h, cp_w)` tuple to
 `SplineMLP` or use `SplineLinear` directly if you want to tune it.
 
-Measurements in [`experiments/`](experiments/).
+### Reaching 98%
+
+The tables above use a deliberately plain recipe (Adam, 5 epochs, no
+augmentation) so that every row is comparable. That recipe understates
+both sides. With a larger grid and modern training:
+
+| configuration | params | accuracy |
+| --- | ---: | ---: |
+| `SplineLinear(784, 256, 108, 188)` + dense head | 23,130 | **98.56%** |
+| dense 784-256-10, same recipe | 204,042 | 99.09% |
+
+**8.8x fewer parameters for about 0.5 points.** Mean of 3 seeds
+(98.51 / 98.51 / 98.67); AdamW + OneCycle, 40 epochs, light affine
+augmentation.
+
+Two levers account for nearly all of the gain over the tables above:
+the **control-point budget** at a sensible aspect ratio (95.95% ->
+98.21%), and the **training recipe** alone with no architecture change
+(93.88% -> 95.95%). Multi-resolution grids, BatchNorm, a wider hidden
+layer and a 2D-aware grid were each measured and none of them helped at
+this budget.
+
+> **Note on the dense baseline.** The `97.75%` in the tables above is
+> what a dense 784-256-10 MLP reaches in 5 epochs of plain Adam — not
+> what the architecture can do. Trained properly it reaches 98.33% in 15
+> epochs and 99.09% with augmentation. The comparison in those tables is
+> still fair, because both sides get the same recipe, but the spline
+> layer does **not** beat dense at any budget measured here.
+
+Full decomposition, controls and the two hypotheses that failed them:
+[`experiments/ATOMICS.md`](experiments/ATOMICS.md).
 
 ## Caveats
 
