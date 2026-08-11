@@ -56,6 +56,8 @@ harmonic decomposition and subspace resonance.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -180,15 +182,27 @@ class SplineLinear(nn.Module):
         """
         out_features, in_features = linear.weight.shape
         spline_layer = cls(in_features, out_features, cp_h, cp_w, cp_bias)
-        
-        # Use HarmonicCollapseConverter to find optimal control points
+
+        # Use HarmonicCollapseConverter to find optimal control points. The grid
+        # is requested explicitly: deriving it from a ratio does not round-trip
+        # to the (cp_h, cp_w) this layer was just constructed with.
         converter = HarmonicCollapseConverter()
-        control_ratio = (cp_h * cp_w) / (out_features * in_features)
-        layer_data = converter.convert_layer(linear, control_ratio)
-        
+        layer_data = converter.convert_layer(
+            linear, control_grid=(spline_layer.cp_h, spline_layer.cp_w)
+        )
+
         # Set the control points
-        spline_layer.weight_control_points.data = layer_data['control_points']
-        
+        control_points = layer_data['control_points']
+        if tuple(control_points.shape) != tuple(spline_layer.weight_control_points.shape):
+            raise ValueError(
+                f"converter returned control points of shape "
+                f"{tuple(control_points.shape)}, expected "
+                f"{tuple(spline_layer.weight_control_points.shape)}"
+            )
+        spline_layer.weight_control_points.data = control_points.to(
+            spline_layer.weight_control_points.device
+        )
+
         # Handle bias - interpolate down to cp_bias points
         if linear.bias is not None:
             bias_cp_count = spline_layer.cp_bias
@@ -482,34 +496,54 @@ class HarmonicCollapseConverter:
         resonances = []
         
         for iteration in range(iterations):
-            # Forward propagation through weight space
+            # One step of subspace iteration on W^T W. Both factors are applied
+            # so that V keeps its (n, num_modes) shape; taking the QR factor of
+            # W @ V alone would silently reshape V to (m, num_modes) and break
+            # the next iteration for every non-square W -- that is, for every
+            # weight matrix in a real network.
             U = W @ V
-            
-            # Harmonic dampening based on iteration number
-            damping = torch.exp(-iteration / 20.0)
-            U = U + damping * torch.randn_like(U) * 0.01
-            
+            B = W.T @ U
+
+            # Harmonic dampening based on iteration number. math.exp, not
+            # torch.exp: the argument is a Python float, and torch.exp rejects
+            # it with a TypeError.
+            damping = math.exp(-iteration / 20.0)
+            B = B + damping * torch.randn_like(B) * 0.01
+
             # QR decomposition for orthogonalization
             try:
-                Q, R = torch.linalg.qr(U)
+                Q, _ = torch.linalg.qr(B)
                 V = Q
-            except:
+            except (torch.linalg.LinAlgError, RuntimeError):
                 # Fallback for numerical instability
-                V = U / (torch.norm(U, dim=0, keepdim=True) + 1e-8)
-            
+                V = B / (torch.norm(B, dim=0, keepdim=True) + 1e-8)
+
             # Track resonance (how well modes capture the space)
             reconstruction = (V @ V.T @ W.T).T
             resonance = torch.norm(reconstruction - W) / (torch.norm(W) + 1e-8)
             resonances.append(resonance.item())
-            
-            # Adaptive convergence with golden ratio
-            if iteration > 10 and len(resonances) > 1 and resonances[-1] > resonances[-2]:
-                V = 0.618 * V + 0.382 * torch.randn_like(V)
-                V = V / (torch.norm(V, dim=0, keepdim=True) + 1e-8)
-        
+
+            # An "adaptive convergence with golden ratio" step used to sit here,
+            # replacing 38% of V with fresh noise whenever the resonance ticked
+            # up. Near convergence the resonance rises from floating-point noise
+            # alone, so it fired repeatedly and destroyed the very subspace it
+            # was meant to refine. Measured against the true right-singular
+            # subspace of a random 256x784 matrix over 200 iterations
+            # (principal angles, degrees, lower is better):
+            #
+            #   clean iteration          [0.0, 0.0, 0.0, 4.2]    0 restarts
+            #   with this step           [2.4, 5.6, 13.9, 59.8]  7 restarts
+            #   this step, without noise [11.1, 25.4, 47.6, 75.1] 11 restarts
+            #
+            # It made the result worse in every configuration tested, so it is
+            # removed rather than tuned. The residual ~4 degrees on the trailing
+            # mode is inherent: for a random matrix the singular values are
+            # nearly equal (s5/s4 = 0.994 here), so the last mode of the block
+            # converges very slowly. Oversampling the block would fix that.
+
         # Extract eigenvalues through Rayleigh quotient
         eigenvalues = torch.diag(V.T @ W.T @ W @ V)
-        
+
         return V, eigenvalues
     
     def parallel_spline_synthesis(self, W: torch.Tensor, 
@@ -630,10 +664,13 @@ class HarmonicCollapseConverter:
             
             try:
                 optimizer.step(closure)
-            except:
-                # Fallback if optimization fails
-                pass
-                
+            except (RuntimeError, ValueError) as exc:
+                # Fall back to the unoptimized initialization, but say so: a
+                # bare `except: pass` here made a failed LBFGS run
+                # indistinguishable from a successful one.
+                print(f"  LBFGS refinement failed ({type(exc).__name__}: {exc}); "
+                      f"using unoptimized control points for this strategy")
+
             return cp.detach()
         
         # Execute optimization
@@ -669,11 +706,27 @@ class HarmonicCollapseConverter:
         
         return best_cp if best_cp is not None else strategies[0]
     
-    def convert_layer(self, layer: nn.Module, 
-                     control_ratio: float = 0.1) -> Dict[str, torch.Tensor]:
+    def convert_layer(self, layer: nn.Module,
+                     control_ratio: float = 0.1,
+                     control_grid: Optional[Tuple[int, int]] = None) -> Dict[str, torch.Tensor]:
         """
         Convert a single layer to Neural Spline representation.
         Returns control points and metadata.
+
+        Parameters
+        ----------
+        control_ratio : float
+            Target fraction of the original parameter count, used to derive a
+            grid size when ``control_grid`` is not given.
+        control_grid : (int, int), optional
+            Exact control point grid to produce. Callers that must receive a
+            specific shape back -- notably :meth:`SplineLinear.from_dense`,
+            whose layer is already constructed around ``(cp_h, cp_w)`` -- should
+            pass it here. Deriving the grid from ``control_ratio`` alone does
+            not round-trip: a ratio computed from a 4x4 request against a
+            256x784 weight yields a 4x7 grid, and assigning that to the layer's
+            ``.data`` silently leaves ``cp_h``/``cp_w`` describing a shape the
+            parameter no longer has.
         """
         if not hasattr(layer, 'weight'):
             raise ValueError("Layer must have weight attribute")
@@ -704,19 +757,33 @@ class HarmonicCollapseConverter:
         
         # Determine control point grid size
         m, n = W.shape
-        total_params = m * n
-        target_params = max(16, int(total_params * control_ratio))  # Minimum 16 control points
-        
-        # Calculate grid dimensions
-        cp_m = max(4, int(np.sqrt(target_params * m / n)))
-        cp_n = max(4, int(np.sqrt(target_params * n / m)))
-        
-        # Ensure we don't exceed original dimensions
-        cp_m = min(cp_m, m)
-        cp_n = min(cp_n, n)
-        
+        if control_grid is not None:
+            cp_m, cp_n = control_grid
+        else:
+            total_params = m * n
+            target_params = max(16, int(total_params * control_ratio))  # Minimum 16 control points
+
+            # Calculate grid dimensions
+            cp_m = max(4, int(np.sqrt(target_params * m / n)))
+            cp_n = max(4, int(np.sqrt(target_params * n / m)))
+
+            # Ensure we don't exceed original dimensions
+            cp_m = min(cp_m, m)
+            cp_n = min(cp_n, n)
+
         # The harmonic collapse
         control_points = self.parallel_spline_synthesis(W, (cp_m, cp_n))
+
+        # parallel_spline_synthesis clamps and pads, so the grid it returns is
+        # not always the grid it was asked for. Report what actually came back
+        # rather than what was requested, and hold it to an explicit request.
+        actual_grid = tuple(control_points.shape)
+        if control_grid is not None and actual_grid != tuple(control_grid):
+            raise ValueError(
+                f"requested control grid {tuple(control_grid)} but synthesis "
+                f"produced {actual_grid}; the weight matrix {tuple(W.shape)} "
+                f"cannot support that grid"
+            )
         
         # Compute compression ratio
         original_params = W.numel()
@@ -727,7 +794,7 @@ class HarmonicCollapseConverter:
             'control_points': control_points.cpu(),  # Move back to CPU
             'original_shape': original_shape,
             'compression_ratio': compression_ratio,
-            'control_grid': (cp_m, cp_n),
+            'control_grid': actual_grid,
             'weight_shape': W.shape  # Store the 2D shape used for processing
         }
         

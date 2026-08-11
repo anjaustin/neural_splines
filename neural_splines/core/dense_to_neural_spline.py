@@ -52,7 +52,7 @@ import torch.nn.functional as F
 from pathlib import Path
 import json
 import argparse
-from typing import Dict, Any
+from typing import Any, Dict, Tuple
 
 # Import from neural_spline.py
 from .neural_spline import (
@@ -61,8 +61,39 @@ from .neural_spline import (
 )
 
 
-def create_spline_model_from_dense(dense_model: nn.Module, 
-                                  control_ratio: float = 0.1) -> nn.Module:
+def _module_key(name: str) -> str:
+    """Map a dotted module path to a key ``nn.ModuleDict`` will accept.
+
+    ``named_modules()`` yields dotted paths for nested models (``layer1.0``),
+    but ``nn.ModuleDict`` rejects any key containing ``"."``. Only flat
+    ``nn.Sequential`` models happened to work before this mapping existed.
+    The root module's name is the empty string, which is also rejected.
+    """
+    return name.replace(".", "__") if name else "_root"
+
+
+def _checked_copy(param: torch.Tensor, saved: torch.Tensor, label: str) -> torch.Tensor:
+    """Return ``saved`` after verifying it matches ``param``'s shape.
+
+    Assigning a differently shaped tensor to ``Parameter.data`` succeeds
+    silently and leaves the layer's declared control-point counts disagreeing
+    with its actual data, which only surfaces much later as a confusing
+    ``state_dict`` size mismatch. Fail here instead.
+    """
+    saved = saved.detach() if hasattr(saved, "detach") else saved
+    if tuple(saved.shape) != tuple(param.shape):
+        raise ValueError(
+            f"{label}: checkpoint holds shape {tuple(saved.shape)} but the layer "
+            f"expects {tuple(param.shape)}. The checkpoint and the layer "
+            f"configuration disagree."
+        )
+    return saved.clone()
+
+
+def create_spline_model_from_dense(
+    dense_model: nn.Module,
+    control_ratio: float = 0.1,
+) -> Tuple[nn.ModuleDict, Dict[str, Dict]]:
     """
     Create a complete spline model from a dense model.
     
@@ -94,8 +125,12 @@ def create_spline_model_from_dense(dense_model: nn.Module,
                 )
                 
                 # Set the control points
-                spline_layer.weight_control_points.data = layer_data['control_points']
-                
+                spline_layer.weight_control_points.data = _checked_copy(
+                    spline_layer.weight_control_points,
+                    layer_data['control_points'],
+                    f"{name}.weight_control_points",
+                )
+
                 # Handle bias
                 if 'bias' in layer_data:
                     # Interpolate bias down to control points
@@ -107,9 +142,9 @@ def create_spline_model_from_dense(dense_model: nn.Module,
                     else:
                         # Pad if bias is smaller than control points
                         spline_layer.bias_control_points.data[:len(bias)] = bias
-                
-                spline_model[name] = spline_layer
-    
+
+                spline_model[_module_key(name)] = spline_layer
+
     return spline_model, spline_data
 
 
@@ -144,21 +179,35 @@ def save_spline_model(spline_model: Dict[str, Any],
     print(f"Saved spline model to {filepath}")
 
 
-def load_spline_model(filepath: Path) -> Dict[str, SplineLinear]:
-    """Load spline model from disk."""
-    checkpoint = torch.load(filepath, map_location='cpu')
-    
+def load_spline_model(filepath: Path) -> nn.ModuleDict:
+    """Load spline model from disk.
+
+    Loaded with ``weights_only=True``: everything written by
+    :func:`save_spline_model` is tensors, plain containers and numbers, so
+    there is no need to allow arbitrary pickle execution here.
+    """
+    checkpoint = torch.load(filepath, map_location='cpu', weights_only=True)
+
     spline_model = nn.ModuleDict()
     config = checkpoint['model_config']
     state_dict = checkpoint['state_dict']
-    
+
     # Recreate layers
     for name, layer_config in config.items():
         layer = SplineLinear(**layer_config)
-        layer.weight_control_points = state_dict[f"{name}.weight_control_points"]
-        layer.bias_control_points = state_dict[f"{name}.bias_control_points"]
-        spline_model[name] = layer
-    
+        # Copy into the existing Parameters rather than rebinding the
+        # attributes, so that a shape mismatch is reported here instead of
+        # silently producing a layer whose cp_h/cp_w disagree with its data.
+        layer.weight_control_points.data = _checked_copy(
+            layer.weight_control_points, state_dict[f"{name}.weight_control_points"],
+            f"{name}.weight_control_points",
+        )
+        layer.bias_control_points.data = _checked_copy(
+            layer.bias_control_points, state_dict[f"{name}.bias_control_points"],
+            f"{name}.bias_control_points",
+        )
+        spline_model[_module_key(name)] = layer
+
     return spline_model
 
 
@@ -174,9 +223,9 @@ def compare_models(dense_model: nn.Module, spline_model: nn.ModuleDict,
         # Get spline model output (manual forward pass)
         x = test_input
         for name, module in dense_model.named_modules():
-            if name in spline_model:
+            if _module_key(name) in spline_model:
                 # Apply spline layer
-                x = spline_model[name](x.view(x.size(0), -1))
+                x = spline_model[_module_key(name)](x.view(x.size(0), -1))
             elif isinstance(module, nn.ReLU):
                 x = F.relu(x)
             elif isinstance(module, nn.Sigmoid):
@@ -276,7 +325,11 @@ def main():
                        help='Output filename for spline model')
     parser.add_argument('--show-edge-cases', action='store_true',
                        help='Demonstrate edge case handling')
-    
+    parser.add_argument('--trust-checkpoint', action='store_true',
+                       help='Allow loading a pickled nn.Module from --model. '
+                            'This executes arbitrary code contained in the file; '
+                            'only use it for checkpoints you produced yourself.')
+
     args = parser.parse_args()
     
     print("🌊 NEURAL SPLINE HARMONIC COLLAPSE CONVERTER 🌊")
@@ -305,7 +358,17 @@ def main():
                     nn.init.constant_(m.bias, 0)
     else:
         print(f"Loading model from {args.model}...")
-        model = torch.load(args.model, map_location='cpu')
+        # torch.load on a pickled nn.Module executes arbitrary code from the
+        # file. Refuse by default and make the user opt in explicitly, rather
+        # than silently unpickling whatever path was passed on the command line.
+        if not args.trust_checkpoint:
+            raise SystemExit(
+                f"Refusing to unpickle {args.model}.\n"
+                "Loading a full nn.Module executes arbitrary code contained in "
+                "the checkpoint. Re-run with --trust-checkpoint if you produced "
+                "this file yourself and trust its contents."
+            )
+        model = torch.load(args.model, map_location='cpu', weights_only=False)
     
     # Convert to splines
     print(f"\nConverting with control ratio: {args.control_ratio}")

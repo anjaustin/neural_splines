@@ -60,6 +60,21 @@ def test_spline_linear_shapes():
     assert layer(torch.randn(8, 64)).shape == (8, 32)
 
 
+def test_bias_is_linearly_interpolated_between_control_points():
+    """Pin the bias interpolation mode.
+
+    Found by mutation testing: switching `_interpolate_bias` from "linear" to
+    "nearest" changed the model's semantics while the whole suite stayed green.
+    With control points [0, 1] spread over 5 outputs, linear interpolation must
+    give an even ramp; "nearest" would produce plateaus instead.
+    """
+    layer = neural_splines.SplineLinear(8, 5, cp_h=4, cp_w=4, cp_bias=2)
+    with torch.no_grad():
+        layer.bias_control_points.copy_(torch.tensor([0.0, 1.0]))
+        bias = layer._interpolate_bias()
+    torch.testing.assert_close(bias, torch.linspace(0.0, 1.0, 5))
+
+
 def test_spline_linear_rejects_too_few_control_points():
     with pytest.raises(ValueError):
         neural_splines.SplineLinear(64, 32, cp_h=3, cp_w=4)
@@ -86,18 +101,61 @@ def test_densification_preserves_outputs():
         torch.testing.assert_close(spline(x), dense(x), rtol=0, atol=0)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "HarmonicCollapseConverter is broken and has never run successfully: "
-        "torch.exp() is called on a Python float in "
-        "subspace_iteration_resonance(). Behind that, the same routine assigns "
-        "the QR factor of a non-square product back to V, so it only ever "
-        "works on square weight matrices. See the audit notes."
-    ),
-)
-def test_converter_is_known_broken():
-    """Documents the converter's state so a green suite does not imply it works."""
+def test_converter_runs_on_non_square_layers():
+    """Regression: the converter used to crash on every input.
+
+    ``torch.exp()`` was called on a Python float, and behind that the QR factor
+    of a non-square product was assigned back to ``V``. Every ``nn.Linear`` in a
+    real network is non-square, so nothing ever converted.
+    """
     converter = neural_splines.HarmonicCollapseConverter()
-    result = converter.convert_layer(torch.nn.Linear(784, 256), 0.05)
+    result = converter.convert_layer(torch.nn.Linear(128, 64), control_ratio=0.05)
     assert result["control_points"].numel() > 0
+    assert tuple(result["control_grid"]) == tuple(result["control_points"].shape)
+
+
+def test_converter_honours_an_explicit_control_grid():
+    """Regression: a 4x4 request against a 256x784 weight silently returned 4x7."""
+    converter = neural_splines.HarmonicCollapseConverter()
+    result = converter.convert_layer(
+        torch.nn.Linear(784, 256), control_grid=(4, 4)
+    )
+    assert tuple(result["control_points"].shape) == (4, 4)
+
+    # A grid the weight matrix cannot support must be refused, not truncated.
+    with pytest.raises(ValueError):
+        converter.convert_layer(torch.nn.Linear(3, 3), control_grid=(8, 8))
+
+
+def test_spline_cannot_represent_a_trained_weight_matrix():
+    """Characterization test for the converter's central limitation.
+
+    Interpolation imposes smoothness on the weight matrix, but a trained
+    weight matrix is not smooth in its index coordinates. Fitting control
+    points to one reconstructs it no better than predicting zeros. This is
+    what makes the compression premise fail, independently of the bugs above.
+
+    The test is deliberately loose: it asserts only that the error is large.
+    If a future change makes splines genuinely fit trained weights, this test
+    fails and should be revisited rather than relaxed.
+    """
+    torch.manual_seed(0)
+    linear = torch.nn.Linear(128, 64)
+    # Give it a weight matrix with realistic (non-smooth) structure.
+    torch.nn.init.kaiming_normal_(linear.weight)
+    W = linear.weight.data
+
+    converter = neural_splines.HarmonicCollapseConverter()
+    result = converter.convert_layer(linear, control_grid=(8, 8))
+    reconstructed = torch.nn.functional.interpolate(
+        result["control_points"][None, None].float(),
+        size=tuple(W.shape),
+        mode="bicubic",
+        align_corners=True,
+    )[0, 0]
+
+    rel_error = (torch.norm(reconstructed - W) / torch.norm(W)).item()
+    assert rel_error > 0.5, (
+        f"relative reconstruction error {rel_error:.4f} is far better than the "
+        "~1.0 previously measured; the compression premise may warrant re-evaluation"
+    )

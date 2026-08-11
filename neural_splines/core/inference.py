@@ -102,7 +102,11 @@ def main() -> None:
     model = DenseMLP(layer1, layer2).to(device)
     # Load saved weights.  Provide a helpful error message if loading fails.
     try:
-        state_dict = torch.load(args.model_path, map_location=device)
+        # weights_only=True: this file is a plain state dict, so there is no
+        # reason to allow a checkpoint to execute arbitrary code on load.
+        state_dict = torch.load(
+            args.model_path, map_location=device, weights_only=True
+        )
     except Exception as e:
         raise RuntimeError(
             f"Failed to load model from {args.model_path}. Ensure that the file "
