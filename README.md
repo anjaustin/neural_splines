@@ -245,29 +245,35 @@ conv = SplineConv2d(16, 32, kernel_size=9, cp_h=5, padding=4)  # 3.2x fewer weig
 dense = conv.to_dense_conv()   # bake in the kernels for inference
 ```
 
-This is the one place in this repository where the spline premise is
-supported rather than contradicted. Fitting control points to a
-*trained* 9x9 filter bank gives 0.34 relative error at 1.7x compression,
-against 0.99 — no better than predicting zeros — for a trained fully
-connected weight matrix. Shuffling the 81 spatial taps, which preserves
-the value distribution exactly, degrades it to 0.87, so the structure
-being exploited is genuinely spatial.
-
-Measured on MNIST (8 epochs, same architecture and recipe):
+Measured on MNIST, 8 epochs, mean of 3 seeds, same architecture and
+recipe throughout:
 
 | configuration | params | conv weights | accuracy |
 | --- | ---: | ---: | ---: |
-| dense 3x3 | 20,490 | 4,752 | 99.14% |
-| dense 9x9 | 58,506 | 42,768 | **99.38%** |
-| spline 9x9 cp=5 | 28,938 | 13,200 | 99.27% |
+| dense 3x3 (c2=32) | 20,490 | 4,752 | 99.08% |
+| dense 3x3 (c2=48, param-matched) | 30,650 | 10,896 | 99.13% |
+| **spline 9x9 cp=5** | **28,938** | **13,200** | **99.34%** |
+| dense 9x9 | 58,506 | 42,768 | 99.37% |
 
-Against the same kernel size it works: 3.2x fewer conv weights for 0.11
-points. **Against a plain 3x3 convolution it does not** — 3x3 is smaller,
-faster and statistically equivalent, and it is what you should use on a
-task like MNIST. The layer earns its place only where large kernels are
-genuinely wanted, or where checkpoint size binds and inference can
-densify on load. Details and caveats:
-[`experiments/CONV.md`](experiments/CONV.md).
+It matches dense 9x9 (0.03 apart, inside noise) at 2x fewer parameters,
+and beats a parameter-matched 3x3 by 0.21 points with non-overlapping
+seed ranges. So it buys large-kernel accuracy at small-kernel parameter
+cost.
+
+**It does not save computation.** A 9x9 convolution performs ~9x the
+multiply-accumulates of a 3x3 one however its kernel is stored, so this
+is a parameter win, not a FLOPs win. `to_dense_conv()` removes the
+interpolation overhead for inference (bit-identical outputs), but the
+cost of the larger kernel remains.
+
+The spatial premise does hold here, which is what makes any of this
+work: fitting control points to a *trained* 9x9 filter bank gives 0.67
+relative error at 5x compression, and shuffling the 81 spatial taps —
+which preserves the value distribution exactly — degrades that to 0.87,
+almost the 0.89 random-filter floor. Note that a fully connected matrix
+at the *same* 5x compression reaches 0.74, so conv filters are modestly
+more spline-compressible, not categorically so. Full numbers, controls
+and two corrected claims: [`experiments/CONV.md`](experiments/CONV.md).
 
 ## Caveats
 

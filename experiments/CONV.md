@@ -1,109 +1,124 @@
-# SplineConv2d: where the spline premise finally holds
+# SplineConv2d
 
-Scripts: `conv_premise.py` (can a spline represent a *trained* filter?),
-`conv_compare.py` (from-scratch accuracy at matched budgets). Logs beside each.
+Scripts: `conv_premise.py`, `conv_compare.py`, and the red-team follow-ups
+`rt_conv_fair.py` (matched-compression comparison, controls, init scale),
+`rt_conv_seeds.py` and `rt_conv_final.py` (seed replication, matched budgets).
+Logs beside each.
+
+> **This document has been substantially corrected.** The first version made
+> two claims that adversarial review overturned — one too generous, one too
+> harsh. Both corrections are recorded below rather than edited away.
 
 ## Summary
 
-The spline premise, which fails outright for fully connected weights, **holds
-for convolution**. The layer works and compresses conv weights ~3.2x for about
-0.1 accuracy points.
+`SplineConv2d` reaches **99.34%** at 28,938 parameters, against **99.13%** for a
+parameter-matched dense 3x3 and **99.37%** for a dense 9x9 using twice the
+parameters. It gets large-kernel accuracy at small-kernel parameter cost.
 
-It nevertheless **does not beat a plain 3x3 convolution**, which is what anyone
-would actually reach for on this task. Both claims are below.
+It does **not** save computation. A 9x9 convolution performs ~9x the multiply-
+accumulates of a 3x3 one no matter how its kernel is stored, and this layer
+changes only the storage.
 
-## The premise holds — and the control says why
+## Correction 1: the premise contrast was a compression-ratio artifact
 
-Fitting control points to a *trained* weight, in closed form (the interpolation
-is linear in the control points, so this is the provable optimum, not a search):
+The first version reported conv at **0.66** relative reconstruction error against
+a fully connected weight matrix's **0.99**, and concluded the spline premise
+"holds for convolution but fails for dense layers".
 
-| target | cp | stored/dense | rel. error |
-| --- | ---: | ---: | ---: |
-| fully connected weight matrix | — | 0.20x | **0.99** |
-| conv1 (1->16, 9x9) | 4 | 0.20x | 0.7126 |
-| conv2 (16->32, 9x9) | 4 | 0.20x | 0.6622 |
-| conv2 (16->32, 9x9) | 5 | 0.31x | 0.5438 |
-| conv2 (16->32, 9x9) | 7 | 0.60x | **0.3369** |
-| **conv2 with the 81 taps shuffled** | 4 | 0.20x | **0.8690** |
+Those two numbers were taken at different compression ratios. The conv figure
+came from a 4x4 grid on a 9x9 filter — **5x** compression. The dense figure came
+from a 4,096-point grid on a 200,704-entry matrix — **49x**. Swept across the
+same ratios, in closed form:
 
-Relative error ~1.0 means no better than predicting zeros, which is where the
-fully connected case sits at every budget. Conv filters are different: at 5x
-compression a spline captures roughly a third of the filter's energy.
+| compression | dense 256x784 | conv 9x9 stack |
+| ---: | ---: | ---: |
+| 5.06x | 0.7443 | 0.6708 |
+| 3.24x | 0.6320 | 0.5568 |
+| 2.25x | 0.5136 | 0.4492 |
+| 1.65x | 0.3489 | 0.3437 |
 
-The last row is the control. Permuting the 81 spatial taps keeps the value
-distribution exactly and destroys only the spatial arrangement — and
-reconstruction degrades from 0.6622 to 0.8690. So the gain comes from genuine
-**spatial structure**, not from anything about the numbers themselves. That is
-the same test that condemned the fully connected case, run the other way round.
+At matched compression the two are close, and converge almost exactly at 1.65x.
+Conv filters are modestly more spline-compressible than dense weights — not
+categorically different. The dramatic contrast was the ratio, not the layer.
 
-## Why the axes matter
+Note also that a 9x9 filter holds only 81 values and cubic interpolation needs a
+4x4 grid, so **5x is the most compression a spline can extract from a 9x9
+kernel at all**. The high-compression regime where dense weights fail outright
+is simply not reachable here, so the two cases cannot be compared there.
 
-A conv weight is `(out_channels, in_channels, kH, kW)`. `SplineConv2d`
-interpolates **only the spatial axes** and leaves the channel axes alone,
-because channel ordering is arbitrary — a network is invariant to permuting
-channels, so channel *c* and *c+1* have no reason to resemble each other.
-Interpolating across an arbitrarily-ordered axis is precisely the mistake that
-costs ~10 accuracy points in the dense case (`ATOMICS.md`).
+## What survives: the spatial structure is real
 
-The saving is `(kH*kW) / (cp_h*cp_w)`. Cubic interpolation needs 4 control
-points per axis, so there is nothing to gain below a 5x5 kernel; the layer
-raises `ValueError` if the grid would not actually compress.
+The mechanism claim holds, and now has a proper null:
 
-## From scratch: the honest comparison
+| conv 9x9 filters, cp=4 (5.06x) | rel. error |
+| --- | ---: |
+| trained filters | **0.6708** |
+| same filters, 81 spatial taps shuffled | 0.8677 |
+| random filters, matched std | **0.8944** |
 
-Same architecture (conv -> ReLU -> pool -> conv -> ReLU -> pool -> linear),
-AdamW + OneCycle, 8 epochs, seed 0.
+Shuffling the taps preserves the value distribution exactly and destroys only
+the spatial arrangement — and that alone moves reconstruction most of the way
+to the random floor. So what the spline exploits in a conv kernel is genuine
+spatial structure, which is the thing that does not exist along the arbitrarily
+ordered axes of a fully connected layer.
 
-| configuration | total params | conv weights | acc | train |
-| --- | ---: | ---: | ---: | ---: |
-| **dense 3x3** (the real baseline) | 20,490 | 4,752 | 99.14% | 56s |
-| dense 9x9 | 58,506 | 42,768 | **99.38%** | 163s |
-| spline 9x9 cp=4 | 24,186 | 8,448 | 99.17% | 162s |
-| **spline 9x9 cp=5** | 28,938 | 13,200 | 99.27% | 163s |
-| spline 13x13 cp=4 | 24,186 | 8,448 | 99.03% | 316s |
-| dense 13x13 | 104,970 | 89,232 | 99.28% | 319s |
+## Correction 2: it does beat a 3x3, which the first version denied
 
-**Against the same kernel size, the layer does its job.** `spline 9x9 cp=5`
-reaches 99.27% against dense 9x9's 99.38% — 3.2x fewer conv weights (13,200
-against 42,768) for 0.11 points.
+The first version concluded "against a plain 3x3 convolution it does not [work]".
+That rested on a single seed, and compared the wrong configuration (`cp=4`, a
+smaller model). With three seeds and a parameter-matched baseline:
 
-**Against a 3x3 convolution, it does not.** Dense 3x3 reaches 99.14% with fewer
-total parameters (20,490 against 28,938) and a third of the training time.
-`spline 9x9 cp=4` is +0.03 points over it for 18% more parameters and 2.9x the
-training time — a wash on accuracy and a loss everywhere else.
+| configuration | params | s0 | s1 | s2 | mean | spread |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| dense 3x3 (c2=32) | 20,490 | 99.14 | 99.04 | 99.05 | 99.08 | 0.10 |
+| dense 3x3 (c2=48, param-matched) | 30,650 | 99.16 | 99.12 | 99.12 | 99.13 | 0.04 |
+| **spline 9x9 cp=5** | **28,938** | 99.40 | 99.30 | 99.31 | **99.34** | 0.10 |
+| dense 9x9 | 58,506 | 99.38 | 99.43 | 99.30 | 99.37 | 0.13 |
 
-Larger kernels do not rescue it: 13x13 is *worse* than 9x9 at the same control
-budget (99.03% against 99.17%) and twice as slow.
+* Against the **parameter-matched** 3x3 the spline wins by **0.21 points with
+  non-overlapping seed ranges**, using 6% fewer parameters.
+* Against **dense 9x9** the gap is **0.03** — comfortably inside noise — at 2.0x
+  fewer total parameters and 3.2x fewer convolution weights.
 
-## Inference cost, and how to remove it
+So the layer delivers 9x9-kernel accuracy at roughly 3x3-kernel parameter cost.
 
-Batch 1, CPU, a single 16->32 9x9 layer:
+## The cost it does not remove
 
-| | latency | checkpoint |
+Parameters are not FLOPs. A 9x9 convolution computes nine times the multiply-
+accumulates of a 3x3 one; storing its kernel compactly does not change that.
+
+| | latency (batch 1) | checkpoint |
 | --- | ---: | ---: |
 | `SplineConv2d` 9x9 cp=5 | 197.7 us | **53,157 B** |
-| `.to_dense_conv()` of it | **68.1 us** | 167,845 B |
+| `.to_dense_conv()` of it | 68.1 us | 167,845 B |
 | `nn.Conv2d` 9x9 | 63.2 us | 167,845 B |
-| `nn.Conv2d` 3x3 | 22.9 us | 20,389 B |
+| `nn.Conv2d` 3x3 | **22.9 us** | 20,389 B |
 
-Interpolating every forward costs about 3x. `to_dense_conv()` removes it
-entirely — 68.1 us against native dense's 63.2 us, with bit-identical outputs —
-so the deployment pattern is: ship the small checkpoint, densify on load. The
-storage saving survives; the latency cost does not have to.
+Two things to read from this. First, `to_dense_conv()` removes the
+interpolation overhead entirely (68.1us against native 63.2us, bit-identical
+outputs), so the deployment pattern is to ship the 3.2x smaller checkpoint and
+densify on load. Second, even densified it remains ~3x slower than a 3x3,
+because that is what a 9x9 convolution costs.
 
-Note that dense 3x3 is still smaller *and* faster than the densified 9x9, which
-is the same conclusion as above from a different direction.
+A caveat on an earlier claim: the training times in `conv_compare.py` showed
+spline 9x9 at 162s and dense 9x9 at 163s — **identical**. The interpolation is
+performed once per forward call and amortised across the batch, so at training
+batch sizes it is free. The 3x figure above is a batch-1 inference artifact and
+should not be read as a general overhead.
+
+## Init scale
+
+Interpolation is linear, so it rescales the control points' standard deviation
+by a fixed factor that depends on the grid and kernel sizes. Initialising the
+grid directly at the Kaiming scale produced kernels **1.48x** larger than
+`nn.Conv2d`'s default. The layer now computes that gain and divides it out;
+measured ratio is 1.00 across every kernel and grid size tested. The effect on
+results was small — 99.32% before the fix against 99.34% after — but the layer
+is now a genuine drop-in for `nn.Conv2d`.
 
 ## Verdict
 
-`SplineConv2d` is a legitimate compression for **large-kernel** convolutions,
-and it is the one place in this repository where the neural-spline idea is
-supported by evidence rather than contradicted by it. Its value depends
-entirely on whether large kernels are warranted for the task. On MNIST they are
-not — 3x3 is sufficient and cheaper on every axis.
-
-Where it would plausibly pay: architectures that genuinely want large receptive
-fields per layer (7x7 and up, as in ConvNeXt-style or RepLKNet-style designs),
-or settings where checkpoint size is the binding constraint and inference can
-densify at load. Neither is demonstrated here, and neither should be claimed
-until it is measured.
+Worth using when large kernels are wanted and parameters are the binding
+constraint. Not worth using to save computation, which it does not do, and not
+obviously worth it on a task where a 3x3 already suffices — though on this task
+it did, in fact, win at matched parameters.

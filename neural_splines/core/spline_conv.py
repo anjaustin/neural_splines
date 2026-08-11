@@ -126,16 +126,44 @@ class SplineConv2d(nn.Module):
 
         # One control grid per channel pair. The channel axes are NOT
         # interpolated -- see the module docstring.
+        #
+        # Interpolation is linear, so it rescales the standard deviation of the
+        # control points by a fixed factor. Initialising the grid directly at
+        # the Kaiming scale therefore produces a *kernel* whose scale is wrong
+        # -- measured at 1.48x too large for a 5x5 grid on a 9x9 kernel. Divide
+        # it out so the interpolated kernel lands at the intended scale.
+        # Target nn.Conv2d's own default so this is a drop-in replacement:
+        # kaiming_uniform_(a=sqrt(5)) has bound sqrt(1/fan_in) and therefore
+        # standard deviation sqrt(1/(3*fan_in)).
         fan_in = (in_channels // groups) * self.kernel_size[0] * self.kernel_size[1]
-        scale = (1.0 / fan_in) ** 0.5
+        target_std = (1.0 / (3.0 * fan_in)) ** 0.5
         self.control_points = nn.Parameter(
-            torch.randn(out_channels, in_channels // groups, cp_h, cp_w) * scale
+            torch.randn(out_channels, in_channels // groups, cp_h, cp_w)
+            * (target_std / self._interpolation_gain())
         )
         self.bias: nn.Parameter | None
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_channels))
         else:
             self.register_parameter("bias", None)
+
+    def _interpolation_gain(self) -> float:
+        """Factor by which interpolation scales the control points' std.
+
+        Bicubic interpolation is a fixed linear map ``kernel = A C B^T``, so for
+        i.i.d. control points the kernel's variance is scaled by the row norms
+        of ``A`` and ``B``. Computed once at construction rather than assumed.
+        """
+        def axis(n_cp: int, n_out: int) -> torch.Tensor:
+            identity = torch.eye(n_cp)
+            return F.interpolate(
+                identity.unsqueeze(0).unsqueeze(0), size=(n_out, n_cp),
+                mode="bicubic", align_corners=True,
+            ).squeeze(0).squeeze(0)
+
+        a = axis(self.cp_h, self.kernel_size[0]).pow(2).sum(dim=1).mean()
+        b = axis(self.cp_w, self.kernel_size[1]).pow(2).sum(dim=1).mean()
+        return float((a * b).sqrt())
 
     def _interpolate_kernel(self) -> torch.Tensor:
         """Expand the control grids into a dense ``(out, in/groups, kH, kW)`` kernel."""
