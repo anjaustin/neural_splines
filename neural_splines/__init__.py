@@ -14,6 +14,7 @@ from .core.neural_spline import (
     HarmonicCollapseConverter,
     HarmonicCollapseConverter as SplineConverter,
 )
+from .core.spline_conv import SplineConv2d
 from .models.base_neural import BaseNeuralModel
 from .compression.adaptive import DeepSeekSplineAdapter
 from .compression.optimizer import CompressionOptimizer
@@ -23,6 +24,7 @@ from .utils.spline_interpolation import spline_interpolation
 __all__ = [
     "__version__",
     "SplineLinear",
+    "SplineConv2d",
     "aspect_grid",
     "SplineMLP",
     "DenseMLP",

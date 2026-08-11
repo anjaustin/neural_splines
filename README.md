@@ -232,6 +232,43 @@ this budget.
 Full decomposition, controls and the two hypotheses that failed them:
 [`experiments/ATOMICS.md`](experiments/ATOMICS.md).
 
+## Convolution
+
+`SplineConv2d` generates convolution kernels from a control grid. It
+interpolates **only the spatial axes** — channel ordering is arbitrary,
+and interpolating across it is the mistake that costs ~10 points above.
+
+```python
+from neural_splines import SplineConv2d
+
+conv = SplineConv2d(16, 32, kernel_size=9, cp_h=5, padding=4)  # 3.2x fewer weights
+dense = conv.to_dense_conv()   # bake in the kernels for inference
+```
+
+This is the one place in this repository where the spline premise is
+supported rather than contradicted. Fitting control points to a
+*trained* 9x9 filter bank gives 0.34 relative error at 1.7x compression,
+against 0.99 — no better than predicting zeros — for a trained fully
+connected weight matrix. Shuffling the 81 spatial taps, which preserves
+the value distribution exactly, degrades it to 0.87, so the structure
+being exploited is genuinely spatial.
+
+Measured on MNIST (8 epochs, same architecture and recipe):
+
+| configuration | params | conv weights | accuracy |
+| --- | ---: | ---: | ---: |
+| dense 3x3 | 20,490 | 4,752 | 99.14% |
+| dense 9x9 | 58,506 | 42,768 | **99.38%** |
+| spline 9x9 cp=5 | 28,938 | 13,200 | 99.27% |
+
+Against the same kernel size it works: 3.2x fewer conv weights for 0.11
+points. **Against a plain 3x3 convolution it does not** — 3x3 is smaller,
+faster and statistically equivalent, and it is what you should use on a
+task like MNIST. The layer earns its place only where large kernels are
+genuinely wanted, or where checkpoint size binds and inference can
+densify on load. Details and caveats:
+[`experiments/CONV.md`](experiments/CONV.md).
+
 ## Caveats
 
 Two properties of this approach are easy to misread, so they are stated

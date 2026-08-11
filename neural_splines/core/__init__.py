@@ -11,6 +11,7 @@ from .neural_spline import (
     SplineLinear,
     SplineMLP,
 )
+from .spline_conv import SplineConv2d
 
 __all__ = [
     "DenseMLP",
@@ -18,4 +19,5 @@ __all__ = [
     "HarmonicCollapseConverter",
     "SplineLinear",
     "SplineMLP",
+    "SplineConv2d",
 ]
