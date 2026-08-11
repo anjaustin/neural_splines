@@ -8,6 +8,7 @@ __version__ = "1.0.0"
 # confusing "NoneType is not callable" at the call site).
 from .core.neural_spline import (
     SplineLinear,
+    aspect_grid,
     SplineMLP,
     DenseMLP,
     HarmonicCollapseConverter,
@@ -22,6 +23,7 @@ from .utils.spline_interpolation import spline_interpolation
 __all__ = [
     "__version__",
     "SplineLinear",
+    "aspect_grid",
     "SplineMLP",
     "DenseMLP",
     "HarmonicCollapseConverter",

@@ -176,12 +176,31 @@ With a rectangular grid and a per-class output layer, **2,954
 parameters reach 95.76% against the dense baseline's 203,530 and
 ~97.8%** — a 69x reduction for about 2 points.
 
-**Caveat: `SplineMLP` cannot express this.** Its constructor passes
-`cp_hidden` to both axes, so the square grid is unavoidable through that
-class. Build the layers with `SplineLinear(in, out, cp_h, cp_w)`
-directly to choose the aspect ratio. Tracked as item C6 in
-[`REMEDIATION.md`](REMEDIATION.md); measurements in
-[`experiments/`](experiments/).
+### Use `--budget`, not `--cp`
+
+`SplineMLP.with_budget` spends a control-point budget on each layer with
+the aspect ratio chosen by :func:`aspect_grid`, instead of forcing a
+square grid. From the CLI:
+
+```bash
+python3 -m neural_splines.core.train --budget 2048 --hidden-size 256 --epochs 5
+```
+
+Measured over two seeds, 5 epochs, at matched parameter counts:
+
+| configuration | params | accuracy |
+| --- | ---: | ---: |
+| `--cp 32` (square) | 2,112 | 82.88% |
+| `--cp 36` (square, param-matched) | 2,664 | 85.08% |
+| **`--budget 2048`** (34x60 and 10x51) | 2,594 | **93.88%** |
+
+**+8.8 points for the same parameter count**, purely from how the budget
+is divided. A hand-tuned grid does slightly better still (95.76% for
+32x64 with uncompressed biases), so `aspect_grid` is a good default
+rather than an optimum — pass an explicit `(cp_h, cp_w)` tuple to
+`SplineMLP` or use `SplineLinear` directly if you want to tune it.
+
+Measurements in [`experiments/`](experiments/).
 
 ## Caveats
 

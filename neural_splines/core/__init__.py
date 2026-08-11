@@ -6,6 +6,7 @@
 # where they looked like part of the package's own API.
 from .neural_spline import (
     DenseMLP,
+    aspect_grid,
     HarmonicCollapseConverter,
     SplineLinear,
     SplineMLP,
@@ -13,6 +14,7 @@ from .neural_spline import (
 
 __all__ = [
     "DenseMLP",
+    "aspect_grid",
     "HarmonicCollapseConverter",
     "SplineLinear",
     "SplineMLP",

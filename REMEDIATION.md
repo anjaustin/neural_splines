@@ -8,9 +8,9 @@ tracked separately and deliberately excluded here.
 Each item marked `done` has been fixed, independently red-teamed, and
 verified by running the code — not by inspection alone.
 
-**Summary: 23 done · 1 open · 2 need a decision · 1 won't fix.**
-Open: **C6**, a one-line default that costs ~11 accuracy points — the highest-value
-item remaining. Decisions: C0 (recommend cutting the converter) and B3 (asset size).
+**Summary: 24 done · 2 need a decision · 1 won't fix.**
+No open work items. Decisions: C0 (recommend cutting the converter) and B3
+(asset size).
 
 > Several conclusions in this document were **overturned by red-teaming their
 > own evidence**, and the corrections are recorded rather than quietly edited
@@ -26,7 +26,7 @@ item remaining. Decisions: C0 (recommend cutting the converter) and B3 (asset si
 | # | Item | Location | Sev | Status | Notes |
 |---|---|---|---|---|---|
 | C0 | Decide: cut the converter, or keep it as a documented dead end | — | High | `needs decision` | **Recommend cut.** Two things are now established. (1) The Frobenius objective is at a *provable* ceiling: `W_hat = A C B^T` is linear in `C`, and LBFGS matches the closed-form optimum `A⁺W(B⁺)ᵀ` to five decimals, so ~98% reconstruction error cannot be optimised away. (2) Changing the objective does not rescue it either — a randomly initialized student trained on labels alone, never seeing the teacher, matches distillation (94.34% vs 94.45%). There is nothing being compressed; it is just training a small model. An earlier revision of this row proposed "replace the objective with distillation" — **that was wrong**, and `experiments/rt_objective.py` is the control that refuted it. |
-| C6 | `SplineMLP` cannot express a non-square control grid | `neural_spline.py` (`SplineMLP.__init__`) | **High** | `open` | **Found while red-teaming C0, and it is the most valuable finding here.** `SplineMLP` passes `cp_hidden` to *both* axes, forcing a square grid on non-square weight matrices. That single default costs ~11 accuracy points. At a fixed 2,954 parameters, a 32x64 grid scores **95.76%** where the repo's square 32x32 default scores **84.05%**. `32x64` and `64x32` have identical rank and identical parameter count yet differ by 10.5 points, so the constraint is input-axis resolution, not the rank bound. Fixing this makes the layer genuinely useful: 69x fewer parameters than dense for ~2 points of accuracy. |
+| C6 | `SplineMLP` cannot express a non-square control grid | `neural_spline.py` (`SplineMLP.__init__`) | **High** | `done` | **Found while red-teaming C0, and it was the most valuable finding here.** `SplineMLP` passed `cp_hidden` to *both* axes, forcing a square grid on non-square weight matrices. `32x64` and `64x32` have identical rank and identical parameter count yet differ by 10.5 points, so the constraint is input-axis resolution, not the rank bound. Fixed: `cp_hidden`/`cp_output` now accept `(cp_h, cp_w)` (an `int` still means square, so nothing breaks), plus `aspect_grid()`, `SplineMLP.with_budget()` and a `--budget` flag on the training CLI. Verified on MNIST over two seeds at matched parameter counts: **93.88% at 2,594 params against 85.08% for the square `--cp 36` at 2,664** — +8.8 points for the same budget. |
 | C1 | `torch.exp()` called on a Python float | `core/neural_spline.py` | High | `done` | Now `math.exp`. Verified: converter runs on every shape tested. |
 | C2 | QR factor of non-square product assigned back to `V` | `core/neural_spline.py` | High | `done` | Both factors now applied so `V` keeps shape `(n, k)`. Verified against SVD: principal angles ~0°, Rayleigh quotients match true squared singular values. |
 | C3 | `from_dense` grid contract mismatch | `neural_spline.py` | High | `done` | `convert_layer` takes an explicit `control_grid`, reports the grid actually produced, and refuses impossible requests. `state_dict` round-trip verified. |

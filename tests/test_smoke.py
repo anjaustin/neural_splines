@@ -91,6 +91,57 @@ def test_interpolated_weight_is_low_rank():
     assert torch.linalg.matrix_rank(W).item() <= 4
 
 
+def test_spline_mlp_accepts_a_rectangular_grid():
+    """Regression: SplineMLP forced a square grid on non-square weights.
+
+    It passed cp_hidden to both axes, so the aspect ratio could not be chosen
+    at all -- a default that costs roughly 11 accuracy points on MNIST.
+    """
+    model = neural_splines.SplineMLP(784, 256, 10, (32, 64), (10, 64))
+    assert (model.spline1.cp_h, model.spline1.cp_w) == (32, 64)
+    assert (model.spline2.cp_h, model.spline2.cp_w) == (10, 64)
+    assert model(torch.randn(4, 784)).shape == (4, 10)
+
+
+def test_spline_mlp_int_still_means_square():
+    """Passing an int must reproduce the original behaviour exactly."""
+    model = neural_splines.SplineMLP(784, 256, 10, 8, 6)
+    assert (model.spline1.cp_h, model.spline1.cp_w) == (8, 8)
+    assert (model.spline2.cp_h, model.spline2.cp_w) == (6, 6)
+
+
+def test_aspect_grid_favours_the_input_axis():
+    """The grid must be wider than it is tall for a wide weight matrix."""
+    cp_h, cp_w = neural_splines.aspect_grid(256, 784, 2048)
+    assert cp_w > cp_h, f"expected a wide grid, got {cp_h}x{cp_w}"
+    assert 16 <= cp_h * cp_w <= 2048
+    assert cp_h >= 4 and cp_w >= 4
+
+
+def test_aspect_grid_gives_a_classifier_head_one_point_per_class():
+    """With few outputs, never interpolate across an arbitrary class ordering."""
+    cp_h, cp_w = neural_splines.aspect_grid(10, 256, 640)
+    assert cp_h == 10, f"expected one control point per class, got cp_h={cp_h}"
+
+
+def test_aspect_grid_never_exceeds_the_matrix_or_the_cubic_minimum():
+    for out_f, in_f, budget in [(256, 784, 2048), (10, 256, 640), (8, 8, 64), (4, 4, 16)]:
+        cp_h, cp_w = neural_splines.aspect_grid(out_f, in_f, budget)
+        assert 4 <= cp_h <= max(4, out_f)
+        assert 4 <= cp_w <= max(4, in_f)
+    with pytest.raises(ValueError):
+        neural_splines.aspect_grid(256, 784, 15)
+
+
+def test_with_budget_builds_a_usable_model():
+    model = neural_splines.SplineMLP.with_budget(784, 256, 10, 2048)
+    assert model.spline1.cp_w > model.spline1.cp_h
+    assert model.spline2.cp_h == 10
+    assert model(torch.randn(4, 784)).shape == (4, 10)
+    # Should land near the requested budget, not wildly over it.
+    assert sum(p.numel() for p in model.parameters()) < 2048 * 2
+
+
 def test_separable_forward_matches_the_materializing_path():
     """The memory-frugal path must compute the same function.
 
