@@ -110,6 +110,11 @@ Measured on the MNIST test set: `SplineMLP(784, 256, 10)`, 5 epochs,
 Adam at lr 1e-3, batch size 128, seed 0, CPU.  `--cp` sets the number
 of control points along **each** axis of both layers.
 
+These numbers describe `SplineMLP` as shipped. They are *not* the limit
+of the spline representation — see
+[the square-grid section](#that-plateau-is-an-artifact-of-the-square-grid-not-a-real-limit)
+below, where the same parameter budget reaches 95.76%.
+
 | `--cp` | trainable params | test accuracy |
 | -----: | ---------------: | ------------: |
 |      4 |               40 |        18.25% |
@@ -133,24 +138,50 @@ marginally and does not close the gap:
 |     40 |    80.82% |    85.66% |
 
 Accuracy rises steeply out of the degenerate regime and then flattens
-in the low-to-mid 80s.  The best configuration measured here (`--cp 32`,
-40 epochs) reaches 85.66% against a dense baseline of 97.75%, so the
-remaining ~12-point gap is a property of the representation rather than
-of the training budget - see the rank argument below.
+in the low-to-mid 80s, and training 8x longer does not close the gap.
 
-The reason is that bicubic upsampling of a `cp_h x cp_w` grid produces
-a weight matrix of rank at most `cp`.  A 4x4 grid expanded to a
-256x784 layer has **rank 4**, with roughly 55% of its spectral energy
-in the first singular value.  The layer is therefore constrained to a
-smooth, low-rank surface over a *fixed* (non-learned) interpolation
-basis - a strictly stronger constraint than a learned low-rank
-factorization of the same rank, which would use 4 x (784 + 256) =
-4,160 parameters where the spline uses 16.
+### That plateau is an artifact of the square grid, not a real limit
 
-The compression ratios are nevertheless real and large: the `--cp 32`
-row above is a 96x reduction in parameters, and `--cp 6` is roughly
-2,400x.  Whether that trade is worthwhile depends entirely on the
-accuracy budget of the target application.
+**The tables above are not the ceiling of this representation.** `--cp N`
+gives every layer an `N x N` control grid, and a square grid is a poor
+fit for a weight matrix that is not square. Layer 1 here is 256x784, so
+a 32x32 grid spreads only 32 control points across 784 input pixels.
+
+Holding the parameter count fixed at 2,954 and changing *only* the grid
+shape (5 epochs, otherwise identical):
+
+| layer-1 grid | rank <= | control points across the 784 inputs | accuracy |
+| --- | ---: | ---: | ---: |
+| 8x256 | 8 | 256 | 92.03% |
+| 16x128 | 16 | 128 | 95.37% |
+| **32x64** | **32** | **64** | **95.76%** |
+| 45x45 | 45 | 45 | 93.23% |
+| **64x32** | **32** | **32** | **85.25%** |
+| 128x16 | 16 | 16 | 84.84% |
+| 256x8 | 8 | 8 | 78.21% |
+
+`32x64` and `64x32` have the **same rank and the same parameter count**
+and differ by 10.5 points; rank-16 beats rank-45. So the binding
+constraint is **resolution along the input axis**, not the rank bound.
+
+It is true that bicubic upsampling of a `cp_h x cp_w` grid yields a
+weight matrix of rank at most `min(cp_h, cp_w)` — a 4x4 grid expanded to
+256x784 measures **rank 4** — and that the basis is fixed rather than
+learned. But at useful budgets that bound is not what limits accuracy;
+how finely the grid can vary across the input dimension is. This is
+consistent with the permutation result in [Caveats](#caveats): both say
+the layer's leverage comes from structure along the input axis.
+
+With a rectangular grid and a per-class output layer, **2,954
+parameters reach 95.76% against the dense baseline's 203,530 and
+~97.8%** — a 69x reduction for about 2 points.
+
+**Caveat: `SplineMLP` cannot express this.** Its constructor passes
+`cp_hidden` to both axes, so the square grid is unavoidable through that
+class. Build the layers with `SplineLinear(in, out, cp_h, cp_w)`
+directly to choose the aspect ratio. Tracked as item C6 in
+[`REMEDIATION.md`](REMEDIATION.md); measurements in
+[`experiments/`](experiments/).
 
 ## Caveats
 
