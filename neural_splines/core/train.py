@@ -53,7 +53,7 @@ The densified model is exportable to ExecuTorch because it no longer
 contains interpolation operations.
 
 Usage:
-    python3 train.py --epochs 5 --batch-size 128 --cp 6
+    python3 -m neural_splines.core.train --epochs 5 --batch-size 128 --cp 6
 
 By default training runs for a small number of epochs to keep
 examples lightweight.  Feel free to adjust hyper‑parameters for
@@ -70,7 +70,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from neural_spline import SplineMLP
+from .neural_spline import SplineMLP
 
 
 def get_data_loaders(batch_size: int) -> Tuple[DataLoader, DataLoader]:

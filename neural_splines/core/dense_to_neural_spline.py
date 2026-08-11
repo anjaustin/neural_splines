@@ -55,7 +55,7 @@ import argparse
 from typing import Dict, Any
 
 # Import from neural_spline.py
-from neural_spline import (
+from .neural_spline import (
     SplineLinear, SplineMLP, HarmonicCollapseConverter,
     DenseMLP
 )

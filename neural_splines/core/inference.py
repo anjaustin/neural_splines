@@ -43,7 +43,7 @@ inference.
 
 Usage example::
 
-    python3 inference.py \
+    python3 -m neural_splines.core.inference \
         --model-path checkpoints/dense_model.pth \
         --input-size 784 --hidden-size 128 --output-size 10 \
         --batch-size 256
@@ -62,7 +62,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from neural_spline import DenseMLP
+from .neural_spline import DenseMLP
 
 
 def get_test_loader(batch_size: int) -> DataLoader:
