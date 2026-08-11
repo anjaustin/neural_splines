@@ -57,6 +57,8 @@ fails, a descriptive error is raised.
 """
 
 import argparse
+from typing import Sized, cast
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -124,7 +126,7 @@ def main() -> None:
             output = model(data)
             pred = output.argmax(dim=1)
             correct += pred.eq(target).sum().item()
-    accuracy = 100.0 * correct / len(loader.dataset)
+    accuracy = 100.0 * correct / len(cast(Sized, loader.dataset))
     print(f"Test accuracy: {accuracy:.2f}%")
 
 

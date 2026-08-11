@@ -62,7 +62,7 @@ better accuracy.
 
 import argparse
 import os
-from typing import Tuple
+from typing import Sized, Tuple, cast
 
 import torch
 import torch.nn as nn
@@ -130,7 +130,7 @@ def train(
         total_loss += loss.item()
         if batch_idx % 100 == 0:
             print(
-                f"Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)}]"
+                f"Train Epoch: {epoch} [{batch_idx * len(data)}/{len(cast(Sized, train_loader.dataset))}]"
                 f"\tLoss: {loss.item():.6f}"
             )
     avg_loss = total_loss / len(train_loader)
@@ -146,7 +146,7 @@ def test(model: nn.Module, device: torch.device, test_loader: DataLoader) -> flo
             output = model(data)
             pred = output.argmax(dim=1)
             correct += pred.eq(target).sum().item()
-    accuracy = 100.0 * correct / len(test_loader.dataset)
+    accuracy = 100.0 * correct / len(cast(Sized, test_loader.dataset))
     print(f"Test accuracy: {accuracy:.2f}%")
     return accuracy
 

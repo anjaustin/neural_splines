@@ -62,7 +62,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class SplineLinear(nn.Module):
@@ -412,9 +412,9 @@ class HarmonicCollapseConverter:
     networks by treating weights as frequency distributions.
     """
     
-    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, device: str = 'cuda' if torch.cuda.is_available() else 'cpu') -> None:
         self.device = device
-        self.resonance_cache = {}
+        self.resonance_cache: Dict[str, torch.Tensor] = {}
         
     def forward_difference_cascade(self, W: torch.Tensor, order: int = 3) -> List[torch.Tensor]:
         """
@@ -605,7 +605,7 @@ class HarmonicCollapseConverter:
             for idx in range(k):
                 i, j = idx // cp_n, idx % cp_n
                 if i < cp_m and j < cp_n:
-                    pos = indices[idx].item()
+                    pos = int(indices[idx].item())
                     row, col = pos // n, pos % n
                     if row < m and col < n:
                         importance_cp[i, j] = W[row, col]
@@ -626,11 +626,11 @@ class HarmonicCollapseConverter:
         strategies.append(subspace_cp)
         
         # Parallel optimization of each strategy
-        def optimize_strategy(cp_init):
+        def optimize_strategy(cp_init: torch.Tensor) -> torch.Tensor:
             cp = cp_init.clone().requires_grad_(True)
             optimizer = torch.optim.LBFGS([cp], lr=0.1, max_iter=20, line_search_fn='strong_wolfe')
             
-            def closure():
+            def closure() -> torch.Tensor:
                 optimizer.zero_grad()
                 # Bicubic interpolation to reconstruct
                 cp_4d = cp.unsqueeze(0).unsqueeze(0)
@@ -660,7 +660,7 @@ class HarmonicCollapseConverter:
                     loss = loss + 0.01 * smooth_loss
                 
                 loss.backward()
-                return loss
+                return cast(torch.Tensor, loss)
             
             try:
                 optimizer.step(closure)
@@ -708,7 +708,7 @@ class HarmonicCollapseConverter:
     
     def convert_layer(self, layer: nn.Module,
                      control_ratio: float = 0.1,
-                     control_grid: Optional[Tuple[int, int]] = None) -> Dict[str, torch.Tensor]:
+                     control_grid: Optional[Tuple[int, int]] = None) -> Dict[str, Any]:
         """
         Convert a single layer to Neural Spline representation.
         Returns control points and metadata.
@@ -730,9 +730,12 @@ class HarmonicCollapseConverter:
         """
         if not hasattr(layer, 'weight'):
             raise ValueError("Layer must have weight attribute")
-        
-        W = layer.weight.data.to(self.device)
-        
+
+        # nn.Module.__getattr__ is typed as returning Tensor | Module | Size, so
+        # the attribute has to be narrowed before it can be used as a tensor.
+        weight = cast(torch.Tensor, layer.weight)
+        W = weight.data.to(self.device)
+
         # Handle different layer types
         original_shape = W.shape
         if len(W.shape) == 4:  # Conv2d
@@ -812,7 +815,7 @@ class HarmonicCollapseConverter:
         The full harmonic collapse of artificial neurons to mathematical curves.
         """
         model = model.to(self.device)
-        spline_model = {}
+        spline_model: Dict[str, Dict] = {}
         
         layers_to_convert = [
             (name, module) for name, module in model.named_modules()

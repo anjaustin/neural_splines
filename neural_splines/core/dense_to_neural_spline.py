@@ -52,7 +52,7 @@ import torch.nn.functional as F
 from pathlib import Path
 import json
 import argparse
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, cast
 
 # Import from neural_spline.py
 from .neural_spline import (
@@ -148,11 +148,11 @@ def create_spline_model_from_dense(
     return spline_model, spline_data
 
 
-def save_spline_model(spline_model: Dict[str, Any], 
+def save_spline_model(spline_model: nn.ModuleDict,
                      spline_data: Dict[str, Dict],
-                     filepath: Path):
+                     filepath: Path) -> None:
     """Save spline model to disk."""
-    checkpoint = {
+    checkpoint: Dict[str, Any] = {
         'spline_data': spline_data,
         'model_config': {
             name: {
@@ -168,7 +168,7 @@ def save_spline_model(spline_model: Dict[str, Any],
     }
     
     # Save state dict
-    state_dict = {}
+    state_dict: Dict[str, torch.Tensor] = {}
     for name, layer in spline_model.items():
         if isinstance(layer, SplineLinear):
             state_dict[f"{name}.weight_control_points"] = layer.weight_control_points
@@ -211,8 +211,8 @@ def load_spline_model(filepath: Path) -> nn.ModuleDict:
     return spline_model
 
 
-def compare_models(dense_model: nn.Module, spline_model: nn.ModuleDict, 
-                  test_input: torch.Tensor):
+def compare_models(dense_model: nn.Module, spline_model: nn.ModuleDict,
+                  test_input: torch.Tensor) -> torch.Tensor:
     """Compare outputs of dense and spline models."""
     dense_model.eval()
     
@@ -236,11 +236,11 @@ def compare_models(dense_model: nn.Module, spline_model: nn.ModuleDict,
     # Compare outputs
     difference = torch.norm(dense_output - x) / torch.norm(dense_output)
     print(f"Relative output difference: {difference:.6f}")
-    
-    return difference
+
+    return cast(torch.Tensor, difference)
 
 
-def analyze_compression(dense_model: nn.Module, spline_data: Dict[str, Dict]):
+def analyze_compression(dense_model: nn.Module, spline_data: Dict[str, Dict]) -> None:
     """Analyze compression achieved by spline conversion."""
     total_original = 0
     total_compressed = 0
@@ -275,7 +275,7 @@ def analyze_compression(dense_model: nn.Module, spline_data: Dict[str, Dict]):
     print("="*60)
 
 
-def demo_edge_cases():
+def demo_edge_cases() -> None:
     """Demonstrate handling of various edge cases."""
     print("\n" + "="*60)
     print("EDGE CASE DEMONSTRATIONS")
@@ -315,7 +315,7 @@ def demo_edge_cases():
     print("="*60)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description='Convert dense models to Neural Splines')
     parser.add_argument('--model', type=str, default='demo', 
                        help='Model to convert (demo/path to .pth file)')

@@ -61,6 +61,18 @@ message(STATUS "Using ExecuTorch library dir: ${EXECUTORCH_LIB_DIR}")
 include_directories(${EXECUTORCH_INCLUDE_DIR})
 link_directories(${EXECUTORCH_LIB_DIR})
 
+# The C++ runner source has never been committed to this repository, so this
+# build cannot succeed as-is. Fail here with an explanation rather than letting
+# CMake emit "Cannot find source file", which reads like a local misconfiguration.
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/run_inference.cpp")
+    message(FATAL_ERROR
+        "src/run_inference.cpp is not present in this repository, so the "
+        "run_inference target cannot be built. This CMakeLists.txt describes "
+        "the intended ExecuTorch build recipe but the source it compiles was "
+        "never committed. Supply src/run_inference.cpp to use this build, or "
+        "ignore this file -- the Python package does not depend on it.")
+endif()
+
 add_executable(run_inference src/run_inference.cpp)
 
 # Link against the ExecuTorch runtime.  On most platforms the library
