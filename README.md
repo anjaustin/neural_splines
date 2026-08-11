@@ -170,10 +170,24 @@ interpolation cost on top. Measured for `SplineMLP(784, 256, 10)` at
 | allocated per forward | 876,704 B | 4,176 B |
 | latency | 443 us | 8.9 us |
 
-So the spline model is ~293x smaller on disk but ~50x slower, with no
-peak-memory benefit. If low runtime memory is the goal, this
-implementation does not deliver it; a streaming variant that
-interpolates and consumes the weight matrix in blocks would be needed.
+So the default forward pass is ~293x smaller on disk but ~50x slower,
+with no peak-memory benefit.
+
+**This is fixable, and is fixed.** Bicubic interpolation is separable, so
+the dense weight factors exactly as `W = A @ control_points @ B.T`, and
+the output can be computed as `((x @ B) @ control_points.T) @ A.T`
+without ever building `W`. Set `layer.separable_forward = True` to use
+it:
+
+| `SplineMLP(784, 256, 10)`, `--cp 6`, batch 1 | default | `separable_forward` |
+| --- | ---: | ---: |
+| allocated per forward | 868,400 B | 12,880 B |
+| latency | 324 us | 24.5 us |
+
+Same function to floating-point precision -- outputs and gradients agree
+to ~1e-14 in float64, and two epochs of training give 78.77% vs 78.76%
+while running about 40% faster. It is opt-in rather than the default
+only so that existing numerics are unchanged.
 
 **The layer assumes neighbouring rows and columns are related.**
 Interpolation imposes smoothness along both weight-matrix axes, which

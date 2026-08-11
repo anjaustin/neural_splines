@@ -91,6 +91,43 @@ def test_interpolated_weight_is_low_rank():
     assert torch.linalg.matrix_rank(W).item() <= 4
 
 
+def test_separable_forward_matches_the_materializing_path():
+    """The memory-frugal path must compute the same function.
+
+    Bicubic interpolation is separable, so W == A @ control_points @ B.T and
+    the dense matrix never has to be built. Checked in float64, where the
+    two orderings agree to machine precision.
+    """
+    torch.manual_seed(0)
+    layer = neural_splines.SplineLinear(128, 64, 6, 6).double()
+    x = torch.randn(8, 128, dtype=torch.float64)
+    with torch.no_grad():
+        torch.testing.assert_close(layer(x), layer.forward_separable(x))
+
+
+def test_separable_forward_matches_gradients():
+    """Gradients must match too, not just outputs."""
+    torch.manual_seed(0)
+    layer = neural_splines.SplineLinear(128, 64, 6, 6).double()
+    x = torch.randn(8, 128, dtype=torch.float64)
+
+    grads = {}
+    for separable in (False, True):
+        layer.zero_grad()
+        layer.separable_forward = separable
+        layer(x).sum().backward()
+        grads[separable] = layer.weight_control_points.grad.clone()
+    torch.testing.assert_close(grads[False], grads[True])
+
+
+def test_separable_buffers_stay_out_of_state_dict():
+    """The cached interpolation operators must not become checkpoint content."""
+    layer = neural_splines.SplineLinear(64, 32, 4, 4)
+    layer.separable_forward = True
+    layer(torch.randn(2, 64))  # populate the cache
+    assert set(layer.state_dict()) == {"weight_control_points", "bias_control_points"}
+
+
 def test_densification_preserves_outputs():
     """to_dense_mlp() must reproduce the spline model's outputs bit-for-bit."""
     torch.manual_seed(0)

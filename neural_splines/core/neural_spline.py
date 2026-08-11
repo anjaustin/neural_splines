@@ -104,6 +104,12 @@ class SplineLinear(nn.Module):
         ``cp_h``.
     """
 
+    # Declared so that mypy knows the type of the lazily populated buffers
+    # registered in __init__; register_buffer(..., None) alone leaves them
+    # untyped.
+    _interp_a: Optional[torch.Tensor]
+    _interp_b: Optional[torch.Tensor]
+
     def __init__(
         self,
         in_features: int,
@@ -158,6 +164,17 @@ class SplineLinear(nn.Module):
         self.bias_control_points = nn.Parameter(
             torch.randn(self.cp_bias) * 0.02
         )
+
+        # Opt-in flag for the memory-frugal forward path; see
+        # :meth:`forward_separable`. Off by default so numerics are unchanged.
+        self.separable_forward = False
+
+        # Cached 1-D interpolation operators, built on first use. Registered as
+        # non-persistent buffers up front so they follow .to(device) and stay
+        # out of state_dict; register_buffer would reject the name later if it
+        # already existed as a plain attribute.
+        self.register_buffer("_interp_a", None, persistent=False)
+        self.register_buffer("_interp_b", None, persistent=False)
 
     @classmethod
     def from_dense(cls, linear: nn.Linear, cp_h: int = 4, cp_w: int = 4, 
@@ -258,8 +275,60 @@ class SplineLinear(nn.Module):
         )
         return dense.squeeze(0).squeeze(0)
 
+    def _interpolation_matrices(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the two 1-D interpolation operators ``(A, B)``.
+
+        Bicubic interpolation is a tensor product of two 1-D cubic
+        interpolations, so the dense weight factors exactly as
+        ``W = A @ control_points @ B.T`` with ``A`` of shape
+        ``(out_features, cp_h)`` and ``B`` of shape ``(in_features, cp_w)``.
+        Both are constants determined by the layer's shape, so they are built
+        once and cached as non-persistent buffers (they follow ``.to(device)``
+        but stay out of ``state_dict``).
+        """
+        if self._interp_a is None or self._interp_b is None:
+            def axis_operator(n_cp: int, n_out: int) -> torch.Tensor:
+                identity = torch.eye(n_cp, device=self.weight_control_points.device,
+                                     dtype=self.weight_control_points.dtype)
+                return F.interpolate(
+                    identity.unsqueeze(0).unsqueeze(0),
+                    size=(n_out, n_cp),
+                    mode="bicubic",
+                    align_corners=True,
+                ).squeeze(0).squeeze(0)
+
+            self._interp_a = axis_operator(self.cp_h, self.out_features)
+            self._interp_b = axis_operator(self.cp_w, self.in_features)
+        assert self._interp_a is not None and self._interp_b is not None
+        return self._interp_a, self._interp_b
+
+    def forward_separable(self, input: torch.Tensor) -> torch.Tensor:
+        """Forward pass that never materializes the dense weight matrix.
+
+        Mathematically identical to :meth:`forward` up to floating point
+        accumulation order, but it contracts the input against the two 1-D
+        interpolation operators instead of building the full
+        ``out_features x in_features`` matrix:
+
+            x @ W.T  ==  ((x @ B) @ control_points.T) @ A.T
+
+        The largest intermediate is ``(batch, cp_w)`` rather than
+        ``(out_features, in_features)``. For ``SplineMLP(784, 256, 10)`` at
+        ``cp = 6`` this cuts the peak intermediate from 200,704 elements to
+        4,704. This is what makes the layer's storage saving translate into a
+        runtime memory saving; :meth:`forward` alone does not.
+        """
+        a, b = self._interpolation_matrices()
+        hidden = input @ b                       # (batch, cp_w)
+        hidden = hidden @ self.weight_control_points.t()   # (batch, cp_h)
+        return hidden @ a.t() + self._interpolate_bias()
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Compute the linear transformation with spline‑generated weights.
+
+        Set ``layer.separable_forward = True`` to route through
+        :meth:`forward_separable`, which avoids materializing the dense weight
+        matrix. It is off by default so that existing numerics are unchanged.
 
         Parameters
         ----------
@@ -271,6 +340,8 @@ class SplineLinear(nn.Module):
         torch.Tensor
             Output tensor of shape ``(batch_size, out_features)``.
         """
+        if self.separable_forward:
+            return self.forward_separable(input)
         weight = self._interpolate_weights()
         bias = self._interpolate_bias()
         return F.linear(input, weight, bias)
