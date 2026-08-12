@@ -296,11 +296,10 @@ interpolation cost on top. Measured for `SplineMLP(784, 256, 10)` at
 So the default forward pass is ~293x smaller on disk but ~50x slower,
 with no peak-memory benefit.
 
-**This is fixable, and is fixed.** Bicubic interpolation is separable, so
+**This is fixable at small grids.** Bicubic interpolation is separable, so
 the dense weight factors exactly as `W = A @ control_points @ B.T`, and
 the output can be computed as `((x @ B) @ control_points.T) @ A.T`
-without ever building `W`. Set `layer.separable_forward = True` to use
-it:
+without ever building `W`. Set `layer.separable_forward = True`:
 
 | `SplineMLP(784, 256, 10)`, `--cp 6`, batch 1 | default | `separable_forward` |
 | --- | ---: | ---: |
@@ -311,6 +310,20 @@ Same function to floating-point precision -- outputs and gradients agree
 to ~1e-14 in float64, and two epochs of training give 78.77% vs 78.76%
 while running about 40% faster. It is opt-in rather than the default
 only so that existing numerics are unchanged.
+
+**It does not help at large grids, which is the regime that reaches
+98%.** The factors `A` and `B` have shapes `(out_features, cp_h)` and
+`(in_features, cp_w)`, and they are cached after the first call, so the
+saving only exists when
+
+```
+out*cp_h + in*cp_w + cp_h*cp_w  <<  out*in
+```
+
+At `--cp 6` the factors cost 25 KB against a 802 KB weight matrix. At the
+`108x188` grid behind the 98.56% result they cost **700 KB**, and total
+RAM measured 806 KB against dense's 818 KB — a 1.5% difference. See
+[Footprint](#footprint) for the full measurement.
 
 **The layer assumes neighbouring rows and columns are related.**
 Interpolation imposes smoothness along both weight-matrix axes, which
@@ -401,3 +414,55 @@ before you depend on it:
 The packaging metadata previously declared MIT while `LICENSE` and every
 source header declared AGPL. That has been corrected to AGPL throughout — the
 metadata was advertising rights the project does not grant.
+
+## Footprint
+
+What "footprint" means depends on which resource binds, and the answers
+diverge sharply here. Measured at batch 1 on CPU, float32:
+
+| configuration | checkpoint | resident | peak fwd | total RAM | latency |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MLP spline `108x188` (98.6%) | **94,749 B** | 92,520 B | 847,504 B | 940,024 B | 407 us |
+| MLP spline, `separable_forward` | **94,749 B** | 792,680 B | 13,712 B | 806,392 B | 22 us |
+| MLP spline, densified at load | *ships 94,749 B* | 814,120 B | 4,176 B | 818,296 B | 9.9 us |
+| MLP dense 784-256-10 (99.1%) | 816,349 B | 814,120 B | 4,176 B | 818,296 B | 9.6 us |
+| CNN spline 9x9 cp=5 (99.3%) | 118,485 B | 115,752 B | 2,094,600 B | 2,210,352 B | 343 us |
+| CNN dense 3x3 (99.1%) | **84,693 B** | 81,960 B | 690,000 B | **771,960 B** | 105 us |
+
+**The saving is in what you ship, not in what you run.** The spline MLP
+checkpoint is 8.6x smaller than the dense one. Its RAM is not: every MLP
+row lands within a few percent of 800 KB, because the dense weight matrix
+has to exist somewhere — materialised per forward, held as cached
+interpolation factors, or expanded once at load.
+
+**The best deployment is usually "ship the small checkpoint, densify at
+load".** That gives the 8.6x smaller download with dense RAM and dense
+latency (9.9 us against 9.6 us), losing nothing at inference. Use
+`to_dense_linear()` / `to_dense_conv()`.
+
+**The spline CNN is not competitive on footprint.** Against a dense 3x3 it
+is larger on disk, larger in RAM and 3.3x slower, for +0.2 accuracy
+points. It only wins against a dense *9x9*, which is a kernel size this
+task does not need.
+
+### The runtime dominates everything above
+
+| | size |
+| --- | ---: |
+| installed `torch` package | **385.8 MB** |
+| largest model in the table | 0.82 MB |
+| smallest model in the table | 0.085 MB |
+
+PyTorch is roughly **470x larger than the biggest model here**. On a device
+that runs Python and torch, saving 720 KB on a checkpoint is not a
+meaningful reduction in anything — the framework decides the footprint.
+
+Model size only becomes the binding constraint once the framework is out
+of the picture: an ExecuTorch, ONNX or TFLite export, or hand-written
+inference code. That is the setting this repository's premise implicitly
+assumes, and it is not demonstrated here — `CMakeLists.txt` describes an
+ExecuTorch runner whose source was never committed. Note also that a
+densified export is the one that converts cleanly, since `F.interpolate`
+is not universally supported by embedded runtimes; exporting the
+separable form instead keeps only matmuls but must carry the `A` and `B`
+factors.
