@@ -36,7 +36,7 @@ The project comprises two stages:
 
 ### Prerequisites
 
-* A Python 3.8+ interpreter.
+* A Python 3.10+ interpreter (torch >= 2.9 ships no wheels below 3.10).
 * Internet access to download PyTorch, torchvision and the MNIST dataset.
 
 ### Setup
@@ -380,3 +380,24 @@ model compression and functional approximation.  It was prepared
 with care to empower researchers worldwide to experiment with
 compressed neural models and to encourage further exploration into
 transcendent parameter structures.
+
+## License
+
+Neural Splines is licensed under the **GNU Affero General Public License,
+version 3 or later** (AGPL-3.0-or-later). The full text is in
+[`LICENSE`](LICENSE).
+
+This is a strong copyleft licence. Two consequences worth stating plainly
+before you depend on it:
+
+* Derivative works must also be licensed under the AGPL, and you must make
+  complete corresponding source available to anyone who receives the
+  software.
+* **Section 13 (the network clause):** if you run a modified version and let
+  users interact with it over a network, you must offer those users its
+  source. Unlike the plain GPL, deploying as a hosted service does not avoid
+  the source-disclosure obligation.
+
+The packaging metadata previously declared MIT while `LICENSE` and every
+source header declared AGPL. That has been corrected to AGPL throughout — the
+metadata was advertising rights the project does not grant.

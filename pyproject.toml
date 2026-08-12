@@ -7,7 +7,9 @@ name = "neural-splines"
 version = "1.0.0"
 description = "Transform neural networks into interpretable mathematical curves using harmonic decomposition and spline interpolation"
 readme = "README.md"
-license = {text = "MIT"}
+# The LICENSE file and every source header declare AGPL-3.0. This previously
+# said MIT, which advertised rights the project does not actually grant.
+license = {text = "AGPL-3.0-or-later"}
 authors = [
     {name = "Robert Sitton", email = "rsitton@quholo.com"}
 ]
@@ -24,7 +26,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -101,6 +103,10 @@ Repository = "https://github.com/anjaustin/neural_splines"
 #   python -m neural_splines.core.inference
 #   python -m neural_splines.core.dense_to_neural_spline
 # Restore this table once cli.py / convert.py / visualization.py do something.
+
+[tool.setuptools]
+# Ship the licence text in built distributions, not just the sdist.
+license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
 where = ["."]
