@@ -43,7 +43,7 @@ inference.
 
 Usage example::
 
-    python3 inference.py \
+    python3 -m neural_splines.core.inference \
         --model-path checkpoints/dense_model.pth \
         --input-size 784 --hidden-size 128 --output-size 10 \
         --batch-size 256
@@ -57,12 +57,14 @@ fails, a descriptive error is raised.
 """
 
 import argparse
+from typing import Sized, cast
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from neural_spline import DenseMLP
+from .neural_spline import DenseMLP
 
 
 def get_test_loader(batch_size: int) -> DataLoader:
@@ -102,7 +104,11 @@ def main() -> None:
     model = DenseMLP(layer1, layer2).to(device)
     # Load saved weights.  Provide a helpful error message if loading fails.
     try:
-        state_dict = torch.load(args.model_path, map_location=device)
+        # weights_only=True: this file is a plain state dict, so there is no
+        # reason to allow a checkpoint to execute arbitrary code on load.
+        state_dict = torch.load(
+            args.model_path, map_location=device, weights_only=True
+        )
     except Exception as e:
         raise RuntimeError(
             f"Failed to load model from {args.model_path}. Ensure that the file "
@@ -120,7 +126,7 @@ def main() -> None:
             output = model(data)
             pred = output.argmax(dim=1)
             correct += pred.eq(target).sum().item()
-    accuracy = 100.0 * correct / len(loader.dataset)
+    accuracy = 100.0 * correct / len(cast(Sized, loader.dataset))
     print(f"Test accuracy: {accuracy:.2f}%")
 
 

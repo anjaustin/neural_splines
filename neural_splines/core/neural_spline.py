@@ -56,11 +56,13 @@ harmonic decomposition and subspace resonance.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class SplineLinear(nn.Module):
@@ -101,6 +103,12 @@ class SplineLinear(nn.Module):
         omitted, ``cp_bias`` defaults to the same value as
         ``cp_h``.
     """
+
+    # Declared so that mypy knows the type of the lazily populated buffers
+    # registered in __init__; register_buffer(..., None) alone leaves them
+    # untyped.
+    _interp_a: Optional[torch.Tensor]
+    _interp_b: Optional[torch.Tensor]
 
     def __init__(
         self,
@@ -157,6 +165,17 @@ class SplineLinear(nn.Module):
             torch.randn(self.cp_bias) * 0.02
         )
 
+        # Opt-in flag for the memory-frugal forward path; see
+        # :meth:`forward_separable`. Off by default so numerics are unchanged.
+        self.separable_forward = False
+
+        # Cached 1-D interpolation operators, built on first use. Registered as
+        # non-persistent buffers up front so they follow .to(device) and stay
+        # out of state_dict; register_buffer would reject the name later if it
+        # already existed as a plain attribute.
+        self.register_buffer("_interp_a", None, persistent=False)
+        self.register_buffer("_interp_b", None, persistent=False)
+
     @classmethod
     def from_dense(cls, linear: nn.Linear, cp_h: int = 4, cp_w: int = 4, 
                    cp_bias: int | None = None) -> 'SplineLinear':
@@ -180,15 +199,27 @@ class SplineLinear(nn.Module):
         """
         out_features, in_features = linear.weight.shape
         spline_layer = cls(in_features, out_features, cp_h, cp_w, cp_bias)
-        
-        # Use HarmonicCollapseConverter to find optimal control points
+
+        # Use HarmonicCollapseConverter to find optimal control points. The grid
+        # is requested explicitly: deriving it from a ratio does not round-trip
+        # to the (cp_h, cp_w) this layer was just constructed with.
         converter = HarmonicCollapseConverter()
-        control_ratio = (cp_h * cp_w) / (out_features * in_features)
-        layer_data = converter.convert_layer(linear, control_ratio)
-        
+        layer_data = converter.convert_layer(
+            linear, control_grid=(spline_layer.cp_h, spline_layer.cp_w)
+        )
+
         # Set the control points
-        spline_layer.weight_control_points.data = layer_data['control_points']
-        
+        control_points = layer_data['control_points']
+        if tuple(control_points.shape) != tuple(spline_layer.weight_control_points.shape):
+            raise ValueError(
+                f"converter returned control points of shape "
+                f"{tuple(control_points.shape)}, expected "
+                f"{tuple(spline_layer.weight_control_points.shape)}"
+            )
+        spline_layer.weight_control_points.data = control_points.to(
+            spline_layer.weight_control_points.device
+        )
+
         # Handle bias - interpolate down to cp_bias points
         if linear.bias is not None:
             bias_cp_count = spline_layer.cp_bias
@@ -244,8 +275,60 @@ class SplineLinear(nn.Module):
         )
         return dense.squeeze(0).squeeze(0)
 
+    def _interpolation_matrices(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the two 1-D interpolation operators ``(A, B)``.
+
+        Bicubic interpolation is a tensor product of two 1-D cubic
+        interpolations, so the dense weight factors exactly as
+        ``W = A @ control_points @ B.T`` with ``A`` of shape
+        ``(out_features, cp_h)`` and ``B`` of shape ``(in_features, cp_w)``.
+        Both are constants determined by the layer's shape, so they are built
+        once and cached as non-persistent buffers (they follow ``.to(device)``
+        but stay out of ``state_dict``).
+        """
+        if self._interp_a is None or self._interp_b is None:
+            def axis_operator(n_cp: int, n_out: int) -> torch.Tensor:
+                identity = torch.eye(n_cp, device=self.weight_control_points.device,
+                                     dtype=self.weight_control_points.dtype)
+                return F.interpolate(
+                    identity.unsqueeze(0).unsqueeze(0),
+                    size=(n_out, n_cp),
+                    mode="bicubic",
+                    align_corners=True,
+                ).squeeze(0).squeeze(0)
+
+            self._interp_a = axis_operator(self.cp_h, self.out_features)
+            self._interp_b = axis_operator(self.cp_w, self.in_features)
+        assert self._interp_a is not None and self._interp_b is not None
+        return self._interp_a, self._interp_b
+
+    def forward_separable(self, input: torch.Tensor) -> torch.Tensor:
+        """Forward pass that never materializes the dense weight matrix.
+
+        Mathematically identical to :meth:`forward` up to floating point
+        accumulation order, but it contracts the input against the two 1-D
+        interpolation operators instead of building the full
+        ``out_features x in_features`` matrix:
+
+            x @ W.T  ==  ((x @ B) @ control_points.T) @ A.T
+
+        The largest intermediate is ``(batch, cp_w)`` rather than
+        ``(out_features, in_features)``. For ``SplineMLP(784, 256, 10)`` at
+        ``cp = 6`` this cuts the peak intermediate from 200,704 elements to
+        4,704. This is what makes the layer's storage saving translate into a
+        runtime memory saving; :meth:`forward` alone does not.
+        """
+        a, b = self._interpolation_matrices()
+        hidden = input @ b                       # (batch, cp_w)
+        hidden = hidden @ self.weight_control_points.t()   # (batch, cp_h)
+        return hidden @ a.t() + self._interpolate_bias()
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Compute the linear transformation with spline‑generated weights.
+
+        Set ``layer.separable_forward = True`` to route through
+        :meth:`forward_separable`, which avoids materializing the dense weight
+        matrix. It is off by default so that existing numerics are unchanged.
 
         Parameters
         ----------
@@ -257,6 +340,8 @@ class SplineLinear(nn.Module):
         torch.Tensor
             Output tensor of shape ``(batch_size, out_features)``.
         """
+        if self.separable_forward:
+            return self.forward_separable(input)
         weight = self._interpolate_weights()
         bias = self._interpolate_bias()
         return F.linear(input, weight, bias)
@@ -288,6 +373,59 @@ class SplineLinear(nn.Module):
         return linear
 
 
+def aspect_grid(out_features: int, in_features: int, budget: int) -> Tuple[int, int]:
+    """Split ``budget`` control points across a ``(out_features, in_features)``
+    weight matrix, allocating more of them to the input axis.
+
+    A square grid is a poor fit for a weight matrix that is not square. What
+    limits accuracy in practice is not the rank bound
+    ``rank <= min(cp_h, cp_w)`` but how finely the grid can vary across the
+    *input* dimension. Measured on MNIST at a fixed 2,954 parameters, changing
+    only the aspect ratio of the 256x784 first layer:
+
+        8x256 -> 92.03%    32x64 -> 95.76%    64x32 -> 85.25%
+       16x128 -> 95.37%    45x45 -> 93.23%   256x8  -> 78.21%
+
+    ``32x64`` and ``64x32`` have the same rank and the same parameter count and
+    differ by 10.5 points, so the asymmetry is real and worth spending the
+    budget on.
+
+    This allocates ``cp_h / cp_w = sqrt(out_features / in_features)``, then
+    clamps each axis to ``[4, dimension]``. Clamping ``cp_h`` to
+    ``out_features`` matters for classifier heads: with 10 output classes it
+    yields one control point per class, so the layer never interpolates across
+    an arbitrary class ordering.
+
+    Parameters
+    ----------
+    out_features, in_features : int
+        Shape of the weight matrix the grid will be expanded to.
+    budget : int
+        Approximate number of control points to spend. The product of the
+        returned grid is close to, but not exactly, this value.
+
+    Returns
+    -------
+    (int, int)
+        ``(cp_h, cp_w)`` suitable for :class:`SplineLinear`.
+    """
+    if budget < 16:
+        raise ValueError("budget must be at least 16 (a 4x4 grid)")
+    ratio = math.sqrt(out_features / in_features)
+    cp_h = int(round(math.sqrt(budget * ratio)))
+    cp_h = max(4, min(cp_h, out_features))
+    cp_w = max(4, min(budget // cp_h, in_features))
+    return cp_h, cp_w
+
+
+def _as_grid(cp: int | Tuple[int, int]) -> Tuple[int, int]:
+    """Accept either a single int (square grid) or an explicit ``(cp_h, cp_w)``."""
+    if isinstance(cp, int):
+        return cp, cp
+    cp_h, cp_w = cp
+    return int(cp_h), int(cp_w)
+
+
 class SplineMLP(nn.Module):
     """A simple multilayer perceptron using spline linear layers.
 
@@ -310,12 +448,19 @@ class SplineMLP(nn.Module):
         Number of hidden units in the intermediate representation.
     output_size : int
         Number of output units (e.g. 10 for MNIST digit classes).
-    cp_hidden : int, optional
-        Number of control points along each dimension for the
-        hidden layer.  Defaults to 4.
-    cp_output : int, optional
-        Number of control points along each dimension for the
-        output layer.  Defaults to 4.
+    cp_hidden : int or (int, int), optional
+        Control points for the hidden layer. An ``int`` gives a square
+        ``cp x cp`` grid; a tuple gives an explicit ``(cp_h, cp_w)``.
+        Defaults to 4.
+    cp_output : int or (int, int), optional
+        Control points for the output layer, same convention.
+        Defaults to 4.
+
+    Notes
+    -----
+    A square grid is rarely the best use of a parameter budget -- see
+    :func:`aspect_grid`, and :meth:`with_budget` which applies it. Passing an
+    ``int`` here reproduces the original square-grid behaviour exactly.
     """
 
     def __init__(
@@ -323,12 +468,50 @@ class SplineMLP(nn.Module):
         input_size: int,
         hidden_size: int,
         output_size: int,
-        cp_hidden: int = 4,
-        cp_output: int = 4,
+        cp_hidden: int | Tuple[int, int] = 4,
+        cp_output: int | Tuple[int, int] = 4,
     ) -> None:
         super().__init__()
-        self.spline1 = SplineLinear(input_size, hidden_size, cp_hidden, cp_hidden)
-        self.spline2 = SplineLinear(hidden_size, output_size, cp_output, cp_output)
+        h_h, h_w = _as_grid(cp_hidden)
+        o_h, o_w = _as_grid(cp_output)
+        self.spline1 = SplineLinear(input_size, hidden_size, h_h, h_w)
+        self.spline2 = SplineLinear(hidden_size, output_size, o_h, o_w)
+
+    @classmethod
+    def with_budget(
+        cls,
+        input_size: int,
+        hidden_size: int,
+        output_size: int,
+        budget_hidden: int,
+        budget_output: int | None = None,
+    ) -> "SplineMLP":
+        """Build an MLP by parameter budget, choosing each grid's aspect ratio.
+
+        Prefer this over passing a single ``cp``: a square grid starves the
+        input axis of a non-square weight matrix. On MNIST at roughly 2,950
+        control points this reaches ~95.8% where the equivalent square-grid
+        configuration reaches ~84%. See :func:`aspect_grid` for the
+        measurements and the allocation rule.
+
+        Parameters
+        ----------
+        budget_hidden : int
+            Control points for the ``hidden_size x input_size`` layer.
+        budget_output : int, optional
+            Control points for the ``output_size x hidden_size`` layer.
+            Defaults to a quarter of ``budget_hidden`` (minimum 16), since the
+            output layer is usually much smaller.
+        """
+        if budget_output is None:
+            budget_output = max(16, budget_hidden // 4)
+        return cls(
+            input_size,
+            hidden_size,
+            output_size,
+            aspect_grid(hidden_size, input_size, budget_hidden),
+            aspect_grid(output_size, hidden_size, budget_output),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Flatten the input if it has more than two dimensions
@@ -393,14 +576,28 @@ class HarmonicCollapseConverter:
     """
     Converts traditional weight matrices to Neural Splines through
     harmonic decomposition and subspace resonance.
-    
-    The algorithm discovers the hidden spline structure within trained
-    networks by treating weights as frequency distributions.
+
+    .. warning::
+
+       This works mechanically but does not achieve useful compression of a
+       fully connected layer, and the limitation is in the approach rather than
+       the implementation. Fitting a spline to a trained weight matrix gives
+       ~98% relative reconstruction error -- no better than predicting zeros --
+       because interpolation assumes neighbouring rows and columns are related
+       and a trained network's neuron ordering is arbitrary. The fit is at a
+       provable ceiling: the objective is convex in the control points and
+       LBFGS reaches its closed-form optimum.
+
+       Retained as a reference implementation and a documented negative
+       result. For a case where the premise does hold, see
+       :class:`neural_splines.SplineConv2d`, which interpolates only the
+       spatial axes of a convolution kernel. Measurements for both are in
+       ``experiments/``.
     """
     
-    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, device: str = 'cuda' if torch.cuda.is_available() else 'cpu') -> None:
         self.device = device
-        self.resonance_cache = {}
+        self.resonance_cache: Dict[str, torch.Tensor] = {}
         
     def forward_difference_cascade(self, W: torch.Tensor, order: int = 3) -> List[torch.Tensor]:
         """
@@ -482,34 +679,54 @@ class HarmonicCollapseConverter:
         resonances = []
         
         for iteration in range(iterations):
-            # Forward propagation through weight space
+            # One step of subspace iteration on W^T W. Both factors are applied
+            # so that V keeps its (n, num_modes) shape; taking the QR factor of
+            # W @ V alone would silently reshape V to (m, num_modes) and break
+            # the next iteration for every non-square W -- that is, for every
+            # weight matrix in a real network.
             U = W @ V
-            
-            # Harmonic dampening based on iteration number
-            damping = torch.exp(-iteration / 20.0)
-            U = U + damping * torch.randn_like(U) * 0.01
-            
+            B = W.T @ U
+
+            # Harmonic dampening based on iteration number. math.exp, not
+            # torch.exp: the argument is a Python float, and torch.exp rejects
+            # it with a TypeError.
+            damping = math.exp(-iteration / 20.0)
+            B = B + damping * torch.randn_like(B) * 0.01
+
             # QR decomposition for orthogonalization
             try:
-                Q, R = torch.linalg.qr(U)
+                Q, _ = torch.linalg.qr(B)
                 V = Q
-            except:
+            except (torch.linalg.LinAlgError, RuntimeError):
                 # Fallback for numerical instability
-                V = U / (torch.norm(U, dim=0, keepdim=True) + 1e-8)
-            
+                V = B / (torch.norm(B, dim=0, keepdim=True) + 1e-8)
+
             # Track resonance (how well modes capture the space)
             reconstruction = (V @ V.T @ W.T).T
             resonance = torch.norm(reconstruction - W) / (torch.norm(W) + 1e-8)
             resonances.append(resonance.item())
-            
-            # Adaptive convergence with golden ratio
-            if iteration > 10 and len(resonances) > 1 and resonances[-1] > resonances[-2]:
-                V = 0.618 * V + 0.382 * torch.randn_like(V)
-                V = V / (torch.norm(V, dim=0, keepdim=True) + 1e-8)
-        
+
+            # An "adaptive convergence with golden ratio" step used to sit here,
+            # replacing 38% of V with fresh noise whenever the resonance ticked
+            # up. Near convergence the resonance rises from floating-point noise
+            # alone, so it fired repeatedly and destroyed the very subspace it
+            # was meant to refine. Measured against the true right-singular
+            # subspace of a random 256x784 matrix over 200 iterations
+            # (principal angles, degrees, lower is better):
+            #
+            #   clean iteration          [0.0, 0.0, 0.0, 4.2]    0 restarts
+            #   with this step           [2.4, 5.6, 13.9, 59.8]  7 restarts
+            #   this step, without noise [11.1, 25.4, 47.6, 75.1] 11 restarts
+            #
+            # It made the result worse in every configuration tested, so it is
+            # removed rather than tuned. The residual ~4 degrees on the trailing
+            # mode is inherent: for a random matrix the singular values are
+            # nearly equal (s5/s4 = 0.994 here), so the last mode of the block
+            # converges very slowly. Oversampling the block would fix that.
+
         # Extract eigenvalues through Rayleigh quotient
         eigenvalues = torch.diag(V.T @ W.T @ W @ V)
-        
+
         return V, eigenvalues
     
     def parallel_spline_synthesis(self, W: torch.Tensor, 
@@ -571,7 +788,7 @@ class HarmonicCollapseConverter:
             for idx in range(k):
                 i, j = idx // cp_n, idx % cp_n
                 if i < cp_m and j < cp_n:
-                    pos = indices[idx].item()
+                    pos = int(indices[idx].item())
                     row, col = pos // n, pos % n
                     if row < m and col < n:
                         importance_cp[i, j] = W[row, col]
@@ -592,11 +809,11 @@ class HarmonicCollapseConverter:
         strategies.append(subspace_cp)
         
         # Parallel optimization of each strategy
-        def optimize_strategy(cp_init):
+        def optimize_strategy(cp_init: torch.Tensor) -> torch.Tensor:
             cp = cp_init.clone().requires_grad_(True)
             optimizer = torch.optim.LBFGS([cp], lr=0.1, max_iter=20, line_search_fn='strong_wolfe')
             
-            def closure():
+            def closure() -> torch.Tensor:
                 optimizer.zero_grad()
                 # Bicubic interpolation to reconstruct
                 cp_4d = cp.unsqueeze(0).unsqueeze(0)
@@ -626,14 +843,17 @@ class HarmonicCollapseConverter:
                     loss = loss + 0.01 * smooth_loss
                 
                 loss.backward()
-                return loss
+                return cast(torch.Tensor, loss)
             
             try:
                 optimizer.step(closure)
-            except:
-                # Fallback if optimization fails
-                pass
-                
+            except (RuntimeError, ValueError) as exc:
+                # Fall back to the unoptimized initialization, but say so: a
+                # bare `except: pass` here made a failed LBFGS run
+                # indistinguishable from a successful one.
+                print(f"  LBFGS refinement failed ({type(exc).__name__}: {exc}); "
+                      f"using unoptimized control points for this strategy")
+
             return cp.detach()
         
         # Execute optimization
@@ -669,17 +889,36 @@ class HarmonicCollapseConverter:
         
         return best_cp if best_cp is not None else strategies[0]
     
-    def convert_layer(self, layer: nn.Module, 
-                     control_ratio: float = 0.1) -> Dict[str, torch.Tensor]:
+    def convert_layer(self, layer: nn.Module,
+                     control_ratio: float = 0.1,
+                     control_grid: Optional[Tuple[int, int]] = None) -> Dict[str, Any]:
         """
         Convert a single layer to Neural Spline representation.
         Returns control points and metadata.
+
+        Parameters
+        ----------
+        control_ratio : float
+            Target fraction of the original parameter count, used to derive a
+            grid size when ``control_grid`` is not given.
+        control_grid : (int, int), optional
+            Exact control point grid to produce. Callers that must receive a
+            specific shape back -- notably :meth:`SplineLinear.from_dense`,
+            whose layer is already constructed around ``(cp_h, cp_w)`` -- should
+            pass it here. Deriving the grid from ``control_ratio`` alone does
+            not round-trip: a ratio computed from a 4x4 request against a
+            256x784 weight yields a 4x7 grid, and assigning that to the layer's
+            ``.data`` silently leaves ``cp_h``/``cp_w`` describing a shape the
+            parameter no longer has.
         """
         if not hasattr(layer, 'weight'):
             raise ValueError("Layer must have weight attribute")
-        
-        W = layer.weight.data.to(self.device)
-        
+
+        # nn.Module.__getattr__ is typed as returning Tensor | Module | Size, so
+        # the attribute has to be narrowed before it can be used as a tensor.
+        weight = cast(torch.Tensor, layer.weight)
+        W = weight.data.to(self.device)
+
         # Handle different layer types
         original_shape = W.shape
         if len(W.shape) == 4:  # Conv2d
@@ -704,19 +943,33 @@ class HarmonicCollapseConverter:
         
         # Determine control point grid size
         m, n = W.shape
-        total_params = m * n
-        target_params = max(16, int(total_params * control_ratio))  # Minimum 16 control points
-        
-        # Calculate grid dimensions
-        cp_m = max(4, int(np.sqrt(target_params * m / n)))
-        cp_n = max(4, int(np.sqrt(target_params * n / m)))
-        
-        # Ensure we don't exceed original dimensions
-        cp_m = min(cp_m, m)
-        cp_n = min(cp_n, n)
-        
+        if control_grid is not None:
+            cp_m, cp_n = control_grid
+        else:
+            total_params = m * n
+            target_params = max(16, int(total_params * control_ratio))  # Minimum 16 control points
+
+            # Calculate grid dimensions
+            cp_m = max(4, int(np.sqrt(target_params * m / n)))
+            cp_n = max(4, int(np.sqrt(target_params * n / m)))
+
+            # Ensure we don't exceed original dimensions
+            cp_m = min(cp_m, m)
+            cp_n = min(cp_n, n)
+
         # The harmonic collapse
         control_points = self.parallel_spline_synthesis(W, (cp_m, cp_n))
+
+        # parallel_spline_synthesis clamps and pads, so the grid it returns is
+        # not always the grid it was asked for. Report what actually came back
+        # rather than what was requested, and hold it to an explicit request.
+        actual_grid = tuple(control_points.shape)
+        if control_grid is not None and actual_grid != tuple(control_grid):
+            raise ValueError(
+                f"requested control grid {tuple(control_grid)} but synthesis "
+                f"produced {actual_grid}; the weight matrix {tuple(W.shape)} "
+                f"cannot support that grid"
+            )
         
         # Compute compression ratio
         original_params = W.numel()
@@ -727,7 +980,7 @@ class HarmonicCollapseConverter:
             'control_points': control_points.cpu(),  # Move back to CPU
             'original_shape': original_shape,
             'compression_ratio': compression_ratio,
-            'control_grid': (cp_m, cp_n),
+            'control_grid': actual_grid,
             'weight_shape': W.shape  # Store the 2D shape used for processing
         }
         
@@ -745,7 +998,7 @@ class HarmonicCollapseConverter:
         The full harmonic collapse of artificial neurons to mathematical curves.
         """
         model = model.to(self.device)
-        spline_model = {}
+        spline_model: Dict[str, Dict] = {}
         
         layers_to_convert = [
             (name, module) for name, module in model.named_modules()

@@ -7,12 +7,11 @@ name = "neural-splines"
 version = "1.0.0"
 description = "Transform neural networks into interpretable mathematical curves using harmonic decomposition and spline interpolation"
 readme = "README.md"
-license = {text = "MIT"}
+# The LICENSE file and every source header declare AGPL-3.0. This previously
+# said MIT, which advertised rights the project does not actually grant.
+license = {text = "AGPL-3.0-or-later"}
 authors = [
-    {name = "Neural Splines Project", email = "neural-splines@example.com"}
-]
-maintainers = [
-    {name = "Neural Splines Project", email = "neural-splines@example.com"}
+    {name = "Robert Sitton", email = "rsitton@quholo.com"}
 ]
 keywords = [
     "neural-networks", 
@@ -27,32 +26,37 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Mathematics",
     "Topic :: Software Development :: Libraries :: Python Modules"
 ]
-requires-python = ">=3.8"
+# torch >= 2.9 publishes wheels for CPython 3.10+ only, so the previously
+# declared ">=3.8" was not installable with the pinned torch floor.
+requires-python = ">=3.10"
+# Only torch and numpy are actually imported by this package. scipy,
+# matplotlib, tqdm, safetensors, transformers, accelerate and huggingface-hub
+# were previously declared here but appear in no import statement; they are
+# moved to the extras that would need them if those features are implemented.
 dependencies = [
     "torch>=2.0.0",
-    "numpy>=1.21.0",
-    "scipy>=1.7.0",
-    "matplotlib>=3.4.0",
-    "tqdm>=4.62.0",
-    "safetensors>=0.3.0",
-    "transformers>=4.30.0",
-    "accelerate>=0.20.0",
-    "huggingface-hub>=0.16.0"
+    "numpy>=1.21.0"
 ]
 
 [project.optional-dependencies]
+# neural_splines/core/train.py and inference.py import torchvision to fetch
+# MNIST. It is not needed to import the library itself.
+examples = [
+    "torchvision>=0.15.0"
+]
 dev = [
+    "torchvision>=0.15.0",
     "pytest>=6.2.0",
     "pytest-cov>=2.12.0",
     "black>=21.6.0",
@@ -62,29 +66,47 @@ dev = [
     "pre-commit>=2.13.0"
 ]
 visualization = [
+    "matplotlib>=3.4.0",
     "seaborn>=0.11.0",
     "plotly>=5.0.0",
     "ipython>=7.25.0",
     "jupyter>=1.0.0"
 ]
+# The `deepseek` extra is retained but currently has no consumer: the module
+# it was added for (neural_splines.models.deepseek_neural) was never committed,
+# and nothing in the package imports transformers, accelerate, huggingface-hub,
+# safetensors, tokenizers or datasets. Installing it today pulls a large
+# dependency tree that no code path uses.
 deepseek = [
+    "transformers>=4.30.0",
+    "accelerate>=0.20.0",
+    "huggingface-hub>=0.16.0",
+    "safetensors>=0.3.0",
     "tokenizers>=0.13.0",
     "datasets>=2.0.0"
 ]
 full = [
-    "neural-splines[dev,visualization,deepseek]"
+    "neural-splines[dev,examples,visualization,deepseek]"
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-username/neural-splines"
-Repository = "https://github.com/your-username/neural-splines"
-Documentation = "https://neural-splines.readthedocs.io"
-"Bug Tracker" = "https://github.com/your-username/neural-splines/issues"
+Homepage = "https://github.com/anjaustin/neural_splines"
+Repository = "https://github.com/anjaustin/neural_splines"
+"Bug Tracker" = "https://github.com/anjaustin/neural_splines/issues"
 
-[project.scripts]
-neural-splines = "neural_splines.cli:main"
-spline-convert = "neural_splines.convert:cli_main"
-spline-visualize = "neural_splines.visualization:cli_main"
+# [project.scripts] intentionally omitted. It previously declared
+# neural-splines, spline-convert and spline-visualize, all pointing at
+# functions that only printed a "placeholder" line, so installing the package
+# put three no-op commands on the user's PATH. The working entry points are
+# the modules themselves:
+#   python -m neural_splines.core.train
+#   python -m neural_splines.core.inference
+#   python -m neural_splines.core.dense_to_neural_spline
+# Restore this table once cli.py / convert.py / visualization.py do something.
+
+[tool.setuptools]
+# Ship the licence text in built distributions, not just the sdist.
+license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -101,7 +123,7 @@ neural_splines = [
 # Black code formatting
 [tool.black]
 line-length = 88
-target-version = ['py38', 'py39', 'py310', 'py311']
+target-version = ['py310', 'py311', 'py312', 'py313']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -162,7 +184,7 @@ exclude_lines = [
 
 # MyPy type checking
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
@@ -179,10 +201,9 @@ strict_equality = true
 [[tool.mypy.overrides]]
 module = [
     "torch.*",
+    "torchvision.*",
     "numpy.*",
     "scipy.*",
-    "matplotlib.*",
-    "transformers.*",
-    "accelerate.*"
+    "matplotlib.*"
 ]
 ignore_missing_imports = true
