@@ -576,9 +576,23 @@ class HarmonicCollapseConverter:
     """
     Converts traditional weight matrices to Neural Splines through
     harmonic decomposition and subspace resonance.
-    
-    The algorithm discovers the hidden spline structure within trained
-    networks by treating weights as frequency distributions.
+
+    .. warning::
+
+       This works mechanically but does not achieve useful compression of a
+       fully connected layer, and the limitation is in the approach rather than
+       the implementation. Fitting a spline to a trained weight matrix gives
+       ~98% relative reconstruction error -- no better than predicting zeros --
+       because interpolation assumes neighbouring rows and columns are related
+       and a trained network's neuron ordering is arbitrary. The fit is at a
+       provable ceiling: the objective is convex in the control points and
+       LBFGS reaches its closed-form optimum.
+
+       Retained as a reference implementation and a documented negative
+       result. For a case where the premise does hold, see
+       :class:`neural_splines.SplineConv2d`, which interpolates only the
+       spatial axes of a convolution kernel. Measurements for both are in
+       ``experiments/``.
     """
     
     def __init__(self, device: str = 'cuda' if torch.cuda.is_available() else 'cpu') -> None:

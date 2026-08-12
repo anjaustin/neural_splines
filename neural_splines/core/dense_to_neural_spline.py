@@ -41,9 +41,26 @@ using the HarmonicCollapseConverter. This script shows how to:
 4. Compare performance and compression ratios
 5. Handle various edge cases
 
-The harmonic collapse algorithm discovers the underlying spline structure
-within trained networks, achieving dramatic compression while preserving
-accuracy.
+Known limitation
+----------------
+This converter fits control points to an existing weight matrix by minimising
+``||W_hat - W||``, and that objective cannot succeed on a fully connected
+layer. Interpolation imposes smoothness along both axes of the weight matrix,
+but the neuron ordering of a trained network is arbitrary, so there is no
+smooth structure there to recover. The demo below converts a 3-layer MLP at
+~20x and reports a relative output difference of about 0.98 -- its own
+"significant differences" verdict.
+
+The fit is at a *provable* ceiling, not an optimiser failure: ``W_hat`` is
+linear in the control points, so the objective is convex, and LBFGS matches the
+closed-form optimum to five decimal places. Changing the objective does not
+rescue it either; a randomly initialised student trained on labels alone,
+never seeing the teacher, matches distillation from it.
+
+Where the same idea does work is :class:`neural_splines.SplineConv2d`, which
+interpolates only the *spatial* axes of a convolution kernel -- axes where
+neighbouring indices are genuinely related. See ``experiments/CONV.md`` and
+item C0 in ``REMEDIATION.md``.
 """
 
 import torch
